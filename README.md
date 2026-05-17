@@ -16,6 +16,18 @@ Edit Diffusion_** and contains the inference runtime, training
 scripts, evaluation harness, and a trained Temporal LLLite adapter
 (v3) used to produce the paper's tables and figures.
 
+## Demo
+
+<video src="https://github.com/otanl/dreamlite-stream/raw/main/assets/demo.mp4" controls width="640">
+  See <a href="assets/demo.mp4">assets/demo.mp4</a> for the live-demo sample.
+</video>
+
+`scripts/demo_camera.py` stylizing a
+[Pexels](https://www.pexels.com/) stock clip on a 3090 Ti at
+512×512. Observed end-to-end fps is slightly below the paper's
+step-only sustained number due to display pacing and frame-drop
+bookkeeping in the demo path.
+
 ## What is in this repository
 
 - A side-stream / main-stream CUDA pipeline that hides the Qwen3-VL

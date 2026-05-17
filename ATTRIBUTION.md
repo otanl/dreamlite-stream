@@ -44,6 +44,17 @@ the LLLite cond encoder; users of the trained adapter weights in
 this repository are bound by the relevant Qwen3-VL license terms in
 addition to the DreamLite license.
 
+## Pexels (demo video)
+
+The 54-second demo clip in `assets/demo.mp4` is a stylized output
+produced by `scripts/demo_camera.py` from a royalty-free stock video
+sourced from [Pexels](https://www.pexels.com/). Pexels content is
+distributed under the [Pexels License](https://www.pexels.com/license/)
+(free for commercial and non-commercial use, modification permitted,
+attribution appreciated but not required). The clip here is a
+derivative work — only the model's stylized output is redistributed,
+not the original Pexels footage.
+
 ## DAVIS-2017 (evaluation)
 
 The headline evaluation in the paper uses
