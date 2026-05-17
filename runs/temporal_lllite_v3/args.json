@@ -1,0 +1,18 @@
+{
+  "model": "F:\\work\\dreamlite\\models\\DreamLite-mobile",
+  "pairs_dir": "F:/work/dreamlite-stream/data/temporal_pairs_v3",
+  "out_dir": "F:/work/dreamlite-stream/runs/temporal_lllite_v3",
+  "size": 512,
+  "batch_size": 1,
+  "gradient_accumulation_steps": 4,
+  "learning_rate": 0.0002,
+  "max_epochs": 12,
+  "save_every": 200,
+  "log_every": 30,
+  "cond_emb_dim": 32,
+  "mlp_dim": 64,
+  "seed": 42,
+  "num_workers": 0,
+  "mixed_precision": "bf16",
+  "gradient_checkpointing": false
+}

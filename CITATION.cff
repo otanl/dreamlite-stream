@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+title: "dreamlite-stream"
+message: "If you use this software, please cite the TMLR submission below."
+type: software
+authors:
+  - given-names: Anonymous
+abstract: >-
+  Video-rate streaming stylization runtime on the smallest
+  vision-aware MLLM-conditioned edit-diffusion stack
+  (DreamLite-mobile + Qwen3-VL). Implements an asymmetric
+  side-stream / main-stream CUDA pipeline, a compile-friendly
+  Temporal LLLite adapter, a periodic cond-refresh and hook-subset
+  schedule, and the full evaluation harness used in the
+  accompanying paper.
+license: Apache-2.0
+preferred-citation:
+  type: article
+  title: >-
+    Video-Rate Streaming Stylization on the Smallest Vision-Aware
+    MLLM-Conditioned Edit Diffusion: Periodic Cond-Refresh and
+    Asymmetric Batched Inference on Distilled UNet + MLLM TE
+  authors:
+    - given-names: Anonymous
+  journal: Transactions on Machine Learning Research
+  year: 2026
+  notes: Under review

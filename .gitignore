@@ -1,0 +1,84 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ===== Environments =====
+.venv/
+venv/
+env/
+.env
+.python-version
+
+# ===== Editors / IDE =====
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ===== Claude Code workspace =====
+.claude/
+
+# ===== Training / experiment outputs (large) =====
+# All experiment outputs are derived; reproduce via scripts/.
+out/
+data/
+
+# Trained checkpoints: never commit weights to the source repo.
+# The v3 LLLite adapter inherits DreamLite-mobile's CC BY-NC 4.0
+# weight licence; pending the upstream attribution check (see
+# notes/email_dreamlite_authors.md) we host weights externally
+# (e.g. HuggingFace) and link from README rather than committing
+# them here. Keep args.json so reproducibility metadata is in-repo.
+runs/*
+!runs/temporal_lllite_v3/
+runs/temporal_lllite_v3/*.safetensors
+!runs/temporal_lllite_v3/args.json
+!runs/.gitkeep
+
+# ===== Datasets (download separately) =====
+# DAVIS raw frames (1.6 GB) and cross-dataset raw sources are derived
+# from public datasets — see assets/README.md for download links.
+assets/davis/
+assets/davis_heldout20_mp4/
+assets/crossds_raw/
+assets/crossds_512/
+
+# Track the small fixtures needed to reproduce paper figures:
+#   assets/davis_mp4/         (10 DAVIS sequences used by champion_eval)
+#   assets/scene_cut/         (Appendix B synthetic cut clips, ~4 MB)
+
+# ===== Paper-figure intermediates =====
+figures_for_paper/
+
+# ===== Local notes / run logs =====
+# Operator-side material (run logs, vast.ai instructions, draft
+# correspondence). Not part of the public artefact.
+notes/
+
+# ===== TensorRT engine artefacts (host-specific) =====
+*.engine
+*.plan
+*.onnx
+trt_cache/
+
+# ===== Misc =====
+*.log
+*.tmp
+*.bak
+*~
+
+# Camera test thumbnails written by scripts/list_cameras.py
+/thumb_cam*.png

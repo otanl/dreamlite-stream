@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dreamlite-stream"
+version = "0.1.0"
+description = "Video-rate streaming stylization runtime for DreamLite-mobile + Qwen3-VL"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Anonymous (TMLR submission)" }]
+keywords = ["diffusion", "video stylization", "real-time", "MLLM", "LLLite"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.4",
+    "diffusers>=0.30",
+    "transformers>=4.50",
+    "opencv-python>=4.9",
+    "pillow>=10.0",
+    "numpy>=1.26",
+    "safetensors>=0.4",
+    "imageio>=2.34",
+    "imageio-ffmpeg>=0.5",
+]
+
+[project.optional-dependencies]
+eval = [
+    "lpips>=0.1.4",
+    "torchvision>=0.18",
+]
+trt = [
+    "tensorrt",
+    "onnx>=1.15",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
