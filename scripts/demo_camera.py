@@ -890,8 +890,12 @@ def main():
     # (kept as the *blended* version so seeding into the next batch
     # preserves continuity).
     prev_blended_bgr: "np.ndarray | None" = None
-    # Lazy-loaded RIFE model (None until first frame if --interp_method=rife)
+    # Lazy-loaded RIFE model (None until first frame if --interp_method=rife).
+    # If load fails (e.g. --rife_path missing or pointing at a non-Practical-
+    # RIFE directory) we fall back to linear interpolation and remember to
+    # not retry every frame.
     _rife_model = None
+    _rife_disabled = False
 
     try:
         while not stop_event.is_set():
@@ -942,16 +946,19 @@ def main():
             if args.interp_factor > 1:
                 from dreamlite_stream.frame_interp import expand_linear
                 in_bgrs = expand_linear(in_bgrs, args.interp_factor)
-                if args.interp_method == "rife":
-                    from dreamlite_stream.frame_interp import (
-                        _load_rife, expand_rife,
-                    )
-                    if _rife_model is None:
+                use_rife = (
+                    args.interp_method == "rife" and not _rife_disabled
+                )
+                if use_rife and _rife_model is None:
+                    # First batch with RIFE requested → try to load. Catch
+                    # any failure (missing repo, missing checkpoint, wrong
+                    # path) and fall back to linear instead of crashing.
+                    from dreamlite_stream.frame_interp import _load_rife
+                    try:
                         if not args.rife_path:
                             raise RuntimeError(
-                                "--interp_method=rife requires --rife_path "
-                                "(directory of a Practical-RIFE checkout). "
-                                "See README for setup."
+                                "--rife_path PATH is required for "
+                                "--interp_method=rife"
                             )
                         rife_model_arg = args.rife_model or args.rife_path
                         _rife_model = _load_rife(
@@ -962,9 +969,30 @@ def main():
                             f"(repo: {args.rife_path})",
                             flush=True,
                         )
-                    out_bgrs = expand_rife(
-                        out_bgrs, args.interp_factor, _rife_model, args.device,
-                    )
+                    except Exception as e:
+                        print(
+                            f"[rife] WARN: load failed ({e}). Falling back "
+                            "to --interp_method=linear for the rest of "
+                            "this session.",
+                            flush=True,
+                        )
+                        _rife_disabled = True
+                        use_rife = False
+                if use_rife and _rife_model is not None:
+                    from dreamlite_stream.frame_interp import expand_rife
+                    try:
+                        out_bgrs = expand_rife(
+                            out_bgrs, args.interp_factor,
+                            _rife_model, args.device,
+                        )
+                    except Exception as e:
+                        print(
+                            f"[rife] WARN: inference failed ({e}). Falling "
+                            "back to linear for the rest of this session.",
+                            flush=True,
+                        )
+                        _rife_disabled = True
+                        out_bgrs = expand_linear(out_bgrs, args.interp_factor)
                 else:
                     out_bgrs = expand_linear(out_bgrs, args.interp_factor)
 
