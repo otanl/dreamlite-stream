@@ -167,10 +167,27 @@ def parse_args():
                    help='Display-side frame interpolation factor. 1 = off; '
                         '2 inserts one intermediate frame between each pair '
                         'of pipeline outputs (doubles displayed fps); 4 '
-                        'inserts three (quadruples displayed fps). V0 uses '
-                        'linear blending — no model invocation, mild ghosting '
-                        'on fast motion. Pipeline throughput is unchanged; '
-                        'this is purely demo polish.')
+                        'inserts three (quadruples displayed fps). The '
+                        'method (linear or RIFE) is chosen by '
+                        '--interp_method. Pipeline throughput is unchanged.')
+    p.add_argument("--interp_method", default="linear",
+                   choices=["linear", "rife"],
+                   help='Interpolation method used when --interp_factor > 1. '
+                        '"linear" (default) blends pixels; cheap, mild '
+                        'ghosting on fast motion. "rife" calls Practical-'
+                        'RIFE on each pair (better motion quality, ~5-15 ms '
+                        'per pair on a 3090 Ti). For "rife" you must also '
+                        'pass --rife_path (and optionally --rife_model).')
+    p.add_argument("--rife_path", default=None,
+                   help='Directory of a Practical-RIFE checkout '
+                        '(https://github.com/hzwer/Practical-RIFE), added to '
+                        'sys.path so the model module is importable. '
+                        'Only used when --interp_method=rife.')
+    p.add_argument("--rife_model", default=None,
+                   help='Path to a Practical-RIFE checkpoint directory or '
+                        '.pkl file (e.g. train_log/RIFE_HDv3.pkl from the '
+                        'Practical-RIFE Google-Drive download). If omitted, '
+                        'defaults to <rife_path>/train_log.')
     p.add_argument("--temporal_blend_alpha", type=float, default=0.0,
                    help='Display-side temporal alpha blend: smooths each '
                         'output toward its predecessor by alpha in [0, 0.95]. '
@@ -873,6 +890,8 @@ def main():
     # (kept as the *blended* version so seeding into the next batch
     # preserves continuity).
     prev_blended_bgr: "np.ndarray | None" = None
+    # Lazy-loaded RIFE model (None until first frame if --interp_method=rife)
+    _rife_model = None
 
     try:
         while not stop_event.is_set():
@@ -916,11 +935,38 @@ def main():
             # Display-side frame interpolation: insert (interp_factor-1)
             # intermediates between each consecutive (in, out) pair.
             # Pipeline throughput is unchanged; this only affects pacing on
-            # the display side.
+            # the display side. The input side always uses linear (camera
+            # motion is the ground truth — no need for learned interp);
+            # the output side uses RIFE when --interp_method=rife is set,
+            # otherwise linear.
             if args.interp_factor > 1:
                 from dreamlite_stream.frame_interp import expand_linear
                 in_bgrs = expand_linear(in_bgrs, args.interp_factor)
-                out_bgrs = expand_linear(out_bgrs, args.interp_factor)
+                if args.interp_method == "rife":
+                    from dreamlite_stream.frame_interp import (
+                        _load_rife, expand_rife,
+                    )
+                    if _rife_model is None:
+                        if not args.rife_path:
+                            raise RuntimeError(
+                                "--interp_method=rife requires --rife_path "
+                                "(directory of a Practical-RIFE checkout). "
+                                "See README for setup."
+                            )
+                        rife_model_arg = args.rife_model or args.rife_path
+                        _rife_model = _load_rife(
+                            rife_model_arg, args.rife_path, args.device,
+                        )
+                        print(
+                            f"[rife] loaded model from {rife_model_arg} "
+                            f"(repo: {args.rife_path})",
+                            flush=True,
+                        )
+                    out_bgrs = expand_rife(
+                        out_bgrs, args.interp_factor, _rife_model, args.device,
+                    )
+                else:
+                    out_bgrs = expand_linear(out_bgrs, args.interp_factor)
 
             # Pace at pipeline rate × interp factor so the expanded sequence
             # fits the same iter_dur window. 1 frame = batch_dur/B/interp sec.

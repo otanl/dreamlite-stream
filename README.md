@@ -133,6 +133,20 @@ matches the paper's per-batch sustained number; the demo's wall-clock
 fps is slightly lower because it includes display pacing and frame-
 drop bookkeeping.
 
+**RIFE setup** (only needed if you pass `--interp_method rife`):
+
+```bash
+# Sibling clone of Practical-RIFE (MIT-licensed)
+git clone https://github.com/hzwer/Practical-RIFE ../Practical-RIFE
+# Download a RIFE_HDv3 checkpoint from the link in their README
+# and place it under ../Practical-RIFE/train_log/
+
+# Then launch the demo with:
+python scripts/demo_camera.py --prompt "..." \
+    --interp_factor 2 --interp_method rife \
+    --rife_path ../Practical-RIFE
+```
+
 Useful tuning flags (`--help` for the full list):
 
 | Flag | What it does |
@@ -143,7 +157,8 @@ Useful tuning flags (`--help` for the full list):
 | `--fixed_noise` | Reuse the same denoise init noise pattern across frames — reduces stochastic flicker; the paper's measurements all use this. |
 | `--quant_te {nf4,fp4,int8}` | Quantise Q3-VL on load (requires `bitsandbytes`). For fitting in lower VRAM; speed-neutral on ≥12 GB hosts. |
 | `--compile_mode reduce-overhead` | Best demo throughput; enables `torch.compile`'s CUDA Graph capture (requires `triton`). |
-| `--interp_factor N` | Display-side frame interpolation (linear blend). `2` doubles, `4` quadruples the displayed fps without invoking the model again. Mild ghosting on fast motion; pipeline throughput unchanged. |
+| `--interp_factor N` | Display-side frame interpolation. `2` doubles, `4` quadruples the displayed fps without invoking the model again. Method is chosen by `--interp_method`. Pipeline throughput unchanged. |
+| `--interp_method {linear,rife}` | `linear` (default) is a cheap pixel blend, mild ghosting on fast motion. `rife` calls [Practical-RIFE](https://github.com/hzwer/Practical-RIFE) per pair on the output side (input side always uses linear). RIFE adds ~5–15 ms per pair but recovers fast-motion fidelity. Requires `--rife_path` (and optionally `--rife_model`). |
 | `--temporal_blend_alpha F` | Sequential temporal blend on output frames (mix `1-α` of current with `α` of predecessor). Reduces static-region flicker; over-strong values blur fast motion. `0.0` = off (default), `0.3–0.6` is the useful range. |
 | `--temporal_blend_warp` | When blending, Farneback-warp the predecessor toward the current frame first. Removes most motion ghosting at the cost of ~5 ms CPU per frame. Pair with `--temporal_blend_alpha > 0`. |
 

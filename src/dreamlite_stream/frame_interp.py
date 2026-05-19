@@ -83,6 +83,140 @@ def _warp_with_flow(img_bgr: np.ndarray, flow: np.ndarray) -> np.ndarray:
     )
 
 
+# ---------------------------------------------------------------------
+# RIFE-based interpolation (Tier 1-A v1)
+# ---------------------------------------------------------------------
+# Wraps Practical-RIFE (https://github.com/hzwer/Practical-RIFE, MIT)
+# as a drop-in replacement for the linear ``expand_linear``.
+#
+# Caller must (a) clone Practical-RIFE somewhere accessible and (b) have
+# a downloaded RIFE_HDv3 checkpoint (or compatible). The model object is
+# cached at module level after first load.
+
+_rife_model = None  # module-level cache
+
+
+def _load_rife(model_path: str, repo_path: Optional[str] = None,
+               device: str = "cuda"):
+    """Lazy-load a Practical-RIFE model.
+
+    Args:
+        model_path: filesystem path to either the ``.pkl`` checkpoint or
+            its containing directory (Practical-RIFE's load_model API
+            takes the directory).
+        repo_path: directory containing a Practical-RIFE checkout. Added
+            to sys.path so ``from model.RIFE_HDv3 import Model`` works.
+            Pass None if Practical-RIFE is already importable.
+        device: target CUDA device.
+
+    Returns:
+        Loaded model instance, cached at module level.
+    """
+    global _rife_model
+    if _rife_model is not None:
+        return _rife_model
+
+    import sys
+    from pathlib import Path
+
+    if repo_path:
+        sys.path.insert(0, str(Path(repo_path).resolve()))
+
+    try:
+        from model.RIFE_HDv3 import Model  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise RuntimeError(
+            "Could not import Practical-RIFE. Pass --rife_path PATH "
+            "where PATH is a clone of "
+            "https://github.com/hzwer/Practical-RIFE (or install it). "
+            f"Underlying error: {e}"
+        ) from e
+
+    import torch  # noqa: F401  (imported so the model finds CUDA)
+
+    model = Model()
+    # load_model expects a DIRECTORY containing train_log/RIFE_HDv3.pkl
+    # by default; accept either form from the user.
+    mp = Path(model_path)
+    if mp.is_file():
+        # User pointed at the .pkl directly; load_model wants the parent.
+        model.load_model(str(mp.parent), -1)
+    else:
+        model.load_model(str(mp), -1)
+    model.eval()
+    if hasattr(model, "device"):
+        try:
+            model.device()
+        except Exception:
+            pass
+
+    _rife_model = model
+    return _rife_model
+
+
+def _bgr_to_rife_tensor(bgr: np.ndarray, device: str = "cuda"):
+    """HxWx3 uint8 BGR → (1, 3, H, W) float32 in [0, 1] on device.
+    Pads H and W to the next multiple of 32 (RIFE requires it)."""
+    import torch
+    import torch.nn.functional as F
+
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    h, w = t.shape[-2:]
+    ph = (32 - h % 32) % 32
+    pw = (32 - w % 32) % 32
+    if ph or pw:
+        t = F.pad(t, (0, pw, 0, ph), mode="replicate")
+    return t.to(device), (h, w)
+
+
+def _rife_tensor_to_bgr(t, orig_hw) -> np.ndarray:
+    """(1, 3, Hp, Wp) float32 → HxWx3 uint8 BGR, cropping the padding."""
+    h, w = orig_hw
+    rgb = (
+        t[:, :, :h, :w].clamp(0, 1).mul_(255.0).byte().cpu().numpy()[0]
+        .transpose(1, 2, 0)
+    )
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def expand_rife(bgr_frames: List[np.ndarray], factor: int, model,
+                device: str = "cuda") -> List[np.ndarray]:
+    """RIFE-based interpolation. Supports ``factor`` in {2, 4} via
+    recursive halving; other factors fall back to a single RIFE
+    midpoint per pair (i.e. effectively factor=2 regardless).
+
+    Quality is noticeably better than ``expand_linear`` on fast
+    non-rigid motion; cost is ~5–15 ms per pair on a 3090 Ti at 512².
+    """
+    if factor < 2 or len(bgr_frames) < 2:
+        return list(bgr_frames)
+
+    import torch
+
+    out: List[np.ndarray] = [bgr_frames[0]]
+    with torch.no_grad():
+        for i in range(len(bgr_frames) - 1):
+            a, b = bgr_frames[i], bgr_frames[i + 1]
+            ta, hwa = _bgr_to_rife_tensor(a, device)
+            tb, _ = _bgr_to_rife_tensor(b, device)
+            mid_t = model.inference(ta, tb, 1.0)
+            mid = _rife_tensor_to_bgr(mid_t, hwa)
+
+            if factor == 4:
+                tm, _ = _bgr_to_rife_tensor(mid, device)
+                left_t = model.inference(ta, tm, 1.0)
+                right_t = model.inference(tm, tb, 1.0)
+                out.append(_rife_tensor_to_bgr(left_t, hwa))
+                out.append(mid)
+                out.append(_rife_tensor_to_bgr(right_t, hwa))
+            else:
+                # factor=2 or unsupported → single midpoint.
+                out.append(mid)
+            out.append(b)
+    return out
+
+
 def expand_linear(bgr_frames: List[np.ndarray], factor: int) -> List[np.ndarray]:
     """Insert ``factor-1`` linearly-blended intermediates between each
     consecutive pair in ``bgr_frames``.
