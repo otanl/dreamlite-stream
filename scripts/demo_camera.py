@@ -163,6 +163,14 @@ def parse_args():
                         'drift comes purely from input changes — useful for '
                         'isolating whether observed flicker is from input '
                         'sensor noise or from the diffusion noise pattern.')
+    p.add_argument("--interp_factor", type=int, default=1,
+                   help='Display-side frame interpolation factor. 1 = off; '
+                        '2 inserts one intermediate frame between each pair '
+                        'of pipeline outputs (doubles displayed fps); 4 '
+                        'inserts three (quadruples displayed fps). V0 uses '
+                        'linear blending — no model invocation, mild ghosting '
+                        'on fast motion. Pipeline throughput is unchanged; '
+                        'this is purely demo polish.')
     p.add_argument("--save_dir", default=str(_ROOT / "out" / "demo"))
     p.add_argument("--verbose_timing", action="store_true",
                    help="Print per-batch collect/prefetch/step timings to console")
@@ -865,11 +873,31 @@ def main():
                 0.85 * fps_smoothed + 0.15 * fps_batch
                 if fps_smoothed > 0 else fps_batch
             )
-            # Pace at pipeline rate (= no display backlog). 1 frame = batch_dur/B sec.
-            per_frame_ms = max(15, min(120, int(round(1000.0 / max(fps_smoothed, 1)))))
 
-            for in_bgr, out_pil in zip(bgrs, outputs):
-                out_bgr = cv2.cvtColor(np.asarray(out_pil), cv2.COLOR_RGB2BGR)
+            # Convert outputs to BGR up front so we can interpolate uniformly
+            # in pixel space.
+            out_bgrs = [
+                cv2.cvtColor(np.asarray(p), cv2.COLOR_RGB2BGR) for p in outputs
+            ]
+            in_bgrs = list(bgrs)
+
+            # Display-side frame interpolation: insert (interp_factor-1)
+            # intermediates between each consecutive (in, out) pair.
+            # Pipeline throughput is unchanged; this only affects pacing on
+            # the display side.
+            if args.interp_factor > 1:
+                from dreamlite_stream.frame_interp import expand_linear
+                in_bgrs = expand_linear(in_bgrs, args.interp_factor)
+                out_bgrs = expand_linear(out_bgrs, args.interp_factor)
+
+            # Pace at pipeline rate × interp factor so the expanded sequence
+            # fits the same iter_dur window. 1 frame = batch_dur/B/interp sec.
+            effective_fps = fps_smoothed * max(1, args.interp_factor)
+            per_frame_ms = max(
+                5, min(120, int(round(1000.0 / max(effective_fps, 1))))
+            )
+
+            for in_bgr, out_bgr in zip(in_bgrs, out_bgrs):
                 sxs = np.concatenate([in_bgr, out_bgr], axis=1)
                 sxs = overlay_text(sxs, [
                     f"B={args.batch_size}  refresh N={args.cond_refresh_every}  "
