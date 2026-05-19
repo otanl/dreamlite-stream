@@ -171,6 +171,21 @@ def parse_args():
                         'linear blending — no model invocation, mild ghosting '
                         'on fast motion. Pipeline throughput is unchanged; '
                         'this is purely demo polish.')
+    p.add_argument("--temporal_blend_alpha", type=float, default=0.0,
+                   help='Display-side temporal alpha blend: smooths each '
+                        'output toward its predecessor by alpha in [0, 0.95]. '
+                        '0 = off (default). Reduces flicker on static '
+                        'regions at the cost of motion-blur ghosting on '
+                        'fast content. Reasonable values: 0.3-0.6. Applied '
+                        'before --interp_factor so interpolation runs on '
+                        'the smoothed sequence.')
+    p.add_argument("--temporal_blend_warp", action="store_true", default=False,
+                   help='Use Farneback flow to warp the predecessor frame '
+                        'toward the current one before blending. Removes '
+                        'most motion-blur ghosting at the cost of ~5 ms per '
+                        'frame on CPU and occasional warp errors at '
+                        'disocclusion edges. Only meaningful when '
+                        '--temporal_blend_alpha > 0.')
     p.add_argument("--save_dir", default=str(_ROOT / "out" / "demo"))
     p.add_argument("--verbose_timing", action="store_true",
                    help="Print per-batch collect/prefetch/step timings to console")
@@ -854,6 +869,10 @@ def main():
 
     save_idx = 0
     fps_smoothed = 0.0  # EMA of pipeline fps
+    # Anchor for cross-batch temporal_blend: last output frame we displayed
+    # (kept as the *blended* version so seeding into the next batch
+    # preserves continuity).
+    prev_blended_bgr: "np.ndarray | None" = None
 
     try:
         while not stop_event.is_set():
@@ -880,6 +899,19 @@ def main():
                 cv2.cvtColor(np.asarray(p), cv2.COLOR_RGB2BGR) for p in outputs
             ]
             in_bgrs = list(bgrs)
+
+            # Display-side temporal alpha blend (applied to outputs only).
+            # Smooths static-region flicker; with --temporal_blend_warp the
+            # predecessor is Farneback-warped toward the current frame so
+            # moving content does not ghost. Seeded with prev_blended_bgr
+            # so continuity holds across batch boundaries.
+            if args.temporal_blend_alpha > 0.0:
+                from dreamlite_stream.frame_interp import temporal_blend
+                out_bgrs = temporal_blend(
+                    out_bgrs, prev_blended_bgr, args.temporal_blend_alpha,
+                    use_flow_warp=args.temporal_blend_warp,
+                )
+                prev_blended_bgr = out_bgrs[-1] if out_bgrs else prev_blended_bgr
 
             # Display-side frame interpolation: insert (interp_factor-1)
             # intermediates between each consecutive (in, out) pair.

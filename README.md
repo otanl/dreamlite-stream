@@ -143,6 +143,9 @@ Useful tuning flags (`--help` for the full list):
 | `--fixed_noise` | Reuse the same denoise init noise pattern across frames — reduces stochastic flicker; the paper's measurements all use this. |
 | `--quant_te {nf4,fp4,int8}` | Quantise Q3-VL on load (requires `bitsandbytes`). For fitting in lower VRAM; speed-neutral on ≥12 GB hosts. |
 | `--compile_mode reduce-overhead` | Best demo throughput; enables `torch.compile`'s CUDA Graph capture (requires `triton`). |
+| `--interp_factor N` | Display-side frame interpolation (linear blend). `2` doubles, `4` quadruples the displayed fps without invoking the model again. Mild ghosting on fast motion; pipeline throughput unchanged. |
+| `--temporal_blend_alpha F` | Sequential temporal blend on output frames (mix `1-α` of current with `α` of predecessor). Reduces static-region flicker; over-strong values blur fast motion. `0.0` = off (default), `0.3–0.6` is the useful range. |
+| `--temporal_blend_warp` | When blending, Farneback-warp the predecessor toward the current frame first. Removes most motion ghosting at the cost of ~5 ms CPU per frame. Pair with `--temporal_blend_alpha > 0`. |
 
 ## Reproducing paper tables and figures
 
