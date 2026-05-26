@@ -18,7 +18,7 @@ scripts, evaluation harness, and a trained Temporal LLLite adapter
 
 ## Demo
 
-<video src="https://github.com/otanl/dreamlite-stream/raw/main/assets/demo.mp4" controls width="640">
+<video src="https://github.com/user-attachments/assets/ef31f68a-bc6a-4e14-b2b9-6a60303db30f" controls width="640">
   See <a href="assets/demo.mp4">assets/demo.mp4</a> for the live-demo sample.
 </video>
 
