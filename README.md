@@ -10,11 +10,13 @@ MLLM-conditioned edit-diffusion stack.
 > commercial use, no malicious use). See [`USE_POLICY.md`](USE_POLICY.md)
 > for the verbatim upstream notice and what it means in practice.
 
-This repository accompanies the TMLR submission **_Video-Rate
-Streaming Stylization on the Smallest Vision-Aware MLLM-Conditioned
-Edit Diffusion_** and contains the inference runtime, training
-scripts, evaluation harness, and a trained Temporal LLLite adapter
-(v3) used to produce the paper's tables and figures.
+This repository accompanies the preprint **_Video-Rate Streaming
+Stylization on a Vision-Aware MLLM-Conditioned Edit Diffusion:
+Asymmetric Batched Inference on a Distilled UNet + MLLM Text Encoder_**
+([arXiv:2606.05981](https://arxiv.org/abs/2606.05981)) and contains
+the inference runtime, training scripts, evaluation harness, and a
+trained Temporal LLLite adapter (v3) used to produce the paper's
+tables and figures.
 
 ## Demo
 
@@ -79,7 +81,7 @@ pip install -e ../dreamlite-lllite
 ## Quick start
 
 Reproduce the champion configuration on the 10 DAVIS-2017
-sequences from Table 4 of the paper:
+sequences from Table II of the paper:
 
 ```bash
 python scripts/champion_eval.py
@@ -164,26 +166,28 @@ Useful tuning flags (`--help` for the full list):
 
 ## Reproducing paper tables and figures
 
-The numbered references match the submitted manuscript.
+Table labels below match the arXiv preprint
+(Roman-numeral table numbering; content described in case of future
+re-numbering).
 
-| Paper artefact | Script | Notes |
+| Paper artefact (content) | Script | Notes |
 |---|---|---|
-| Table 4 (main ablation) | `scripts/comprehensive_ablation.py` | all rows of the speed pipeline + LLLite + hook subset |
-| Table 6 (in-pipeline profile) | `scripts/profile_inpipeline.py` | TE/UNet/VAE per-batch wall, side vs. main |
-| Table 8 (cond-refresh sweep) | `scripts/cond_refresh_sweep_downblocks.py` + `scripts/cond_refresh_spatial_metrics.py` | N in {1,4,8,16} fps/εw plus Sobel/HF-FFT/LPIPS-to-N=1 |
-| Table 10 (3-video held-out) | `scripts/eval_heldout_video.py` | requires the v5 held-out checkpoint |
-| Table 11 (held-out prompts) | `scripts/eval_heldout_prompts.py` | comic / ukiyo-e / van Gogh |
-| Table 12 (multi-prompt v4) | `scripts/eval_multiprompt.py` | 5-prompt v4 LLLite |
-| Table 13 (cross-dataset) | `scripts/phase3_crossds_local.py` | 15 clips from 7 non-DAVIS sources |
-| Table 14 (DAVIS-19 unused held-out) | `scripts/champion_eval.py` with `--sequences` overridden | see paper §heldout |
-| Table 15 (sustained throughput) | `scripts/sustained_throughput_test.py` | 480-frame run + latency p50/p95 |
-| Tables 17, 18 (RAFT cross-check, Appendix A) | `scripts/raft_warp_error.py`, `scripts/raft_warp_error_ordering.py` | Farneback vs. RAFT |
-| Tables 19, 20 (scene-cut, Appendix B) | `scripts/scene_cut_eval.py`, `scripts/scene_cut_lpips.py` | synthetic hard cuts |
-| Figure 1 (smoothing artifact) | `scripts/viz_temporal_pair.py` | LCM-LoRA vs. LLLite vs. baseline |
-| Figure 2 (pipeline schematic) | — | drawn from Table 6 numbers, source SVG in the paper repo |
-| Figures 3, 4 (qualitative grids) | `scripts/extract_figure_frames.py` + `build_qualitative_grid_svg.py` + `build_scenecut_grid_svg.py` | regenerate from the saved mp4s |
-| Negative result 5 (token pruning) | `scripts/champion_eval_token_pruning.py` | pruned-prompt eval |
-| TensorRT path (negative result 4) | `scripts/export_unet_lllite_onnx.py`, `scripts/build_trt_engine_mixed.py`, `scripts/debug_lllite_trt_drift.py` | LLLite-baked TRT export attempt |
+| Table II — Main DAVIS-2017 results | `scripts/comprehensive_ablation.py` | all rows of the speed pipeline + LLLite + hook subset |
+| Table III — Sustained throughput + latency | `scripts/sustained_throughput_test.py` | 480-frame *parkour* loop, p50/p95 latency |
+| Table IV — In-pipeline component profile | `scripts/profile_inpipeline.py` | TE/UNet/VAE per-batch wall, side vs. main |
+| Table V — Per-component batch scaling | `scripts/pareto_batch_sweep.py` | sub-linearity per component |
+| Table VI — Cond-refresh sweep | `scripts/cond_refresh_sweep_downblocks.py` + `scripts/cond_refresh_spatial_metrics.py` | N in {1,4,8,16} fps/εw + Sobel/HF-FFT/LPIPS-to-N=1 |
+| Table VII — Long-sequence drift | `scripts/sustained_throughput_test.py --chunked` | 480-frame *parkour*, per-64-frame chunk std |
+| Table VIII — Scene-cut robustness | `scripts/scene_cut_eval.py`, `scripts/scene_cut_lpips.py` | synthetic hard-cut clips |
+| Table IX — Transfer evaluation (v5-heldout / DAVIS-19 unused / cross-dataset) | `scripts/eval_heldout_video.py`, `scripts/champion_eval.py --sequences ...`, `scripts/phase3_crossds_local.py` | (a)+(b)+(c) panels of Table IX |
+| Table X — Multi-prompt v4 LLLite | `scripts/eval_multiprompt.py` | 5-prompt v4 LLLite |
+| Table XI — Hardware scaling (3090 Ti / 4090 / 5090) | `scripts/champion_eval.py` per host | sustained fps headline across GPUs |
+| Table XII — LCM-LoRA distillation case study | `scripts/train_lcm_lora.py` + `scripts/champion_eval.py` | v1 blended-teacher target negative result |
+| Figure 1 — Smoothing artefact teaser | `scripts/viz_temporal_pair.py` | LCM-LoRA vs. LLLite vs. baseline |
+| Figure 2 — Pipeline schematic | — | drawn from Table IV numbers, source SVG in the paper repo |
+| Figures 3, 4 — Qualitative grids | `scripts/extract_figure_frames.py` + `build_qualitative_grid_svg.py` + `build_scenecut_grid_svg.py` | regenerate from the saved mp4s |
+| Negative result — Token pruning | `scripts/champion_eval_token_pruning.py` | pruned-prompt eval |
+| Negative result — TensorRT path | `scripts/export_unet_lllite_onnx.py`, `scripts/build_trt_engine_mixed.py`, `scripts/debug_lllite_trt_drift.py` | LLLite-baked TRT export attempt |
 
 Pre-computed per-row results are committed under `out/.../results.jsonl`
 where the file size allows, so reviewers can verify the table numbers
@@ -192,15 +196,21 @@ without rerunning. (Mp4 outputs themselves are not committed; see
 
 ## Released artefacts
 
-- **v3 Temporal LLLite checkpoint** (~51 MB; 38 attention hooks on
-  the DreamLite-mobile UNet `down_blocks` after load-time subset
-  filtering) — **not committed to this repository.** The weights
+- **v3 Temporal LLLite checkpoint** (`temporal_lllite_step001440.safetensors`,
+  ~51 MB; 38 attention hooks on the DreamLite-mobile UNet
+  `down_blocks` after load-time subset filtering). The weights
   are Adapted Material of DreamLite-mobile and inherit
-  DreamLite's CC BY-NC 4.0 weight licence; pending the upstream
-  attribution check we host them externally (HuggingFace release
-  link to be added here once available). The training-args
-  metadata is committed under `runs/temporal_lllite_v3/args.json`
-  so the recipe is fully reproducible from the training script
+  DreamLite's CC BY-NC 4.0 weight licence. Mirrors:
+    - GitHub release: <https://github.com/otanl/dreamlite-stream/releases/tag/v0.1.0-tcsvt-submission>
+      (asset `temporal_lllite_step001440.safetensors`, SHA-256
+      `88082c6bf56770469ad4ecbbca467b315ffcf4b5287fd17733751e2952fee7fc`).
+    - HuggingFace: <https://huggingface.co/otnl/dreamlite-stream-temporal-lllite-v3>
+      (same file, same SHA-256).
+    - Zenodo (code state at submission): <https://doi.org/10.5281/zenodo.20389428>.
+
+  The training-args metadata is committed under
+  `runs/temporal_lllite_v3/args.json` so the recipe is fully
+  reproducible from the training script
   (`scripts/train_temporal_lllite.py`) given the upstream
   DreamLite-mobile weights.
 - **Per-sequence JSONL** evaluation logs are committed under
@@ -211,9 +221,9 @@ without rerunning. (Mp4 outputs themselves are not committed; see
 ## Reproducibility caveats
 
 We do not redistribute the DreamLite-mobile UNet weights or the
-Qwen3-VL TE weights. The TMLR submission's Reproducibility section
-documents what can and cannot be verified without upstream weight
-access: the **inference pipeline reformulation**, the
+Qwen3-VL TE weights. The preprint's Reproducibility section documents
+what can and cannot be verified without upstream weight access:
+the **inference pipeline reformulation**, the
 **compile-friendly LLLite module**, the **trained adapter**, the
 **benchmark scripts**, the **TRT export tooling**, and the
 **per-sequence JSONL** profiler logs are all in this repo. The
@@ -222,16 +232,35 @@ weights under their respective licenses.
 
 ## Citation
 
+Please cite the arXiv preprint:
+
 ```bibtex
-@article{anonymous2026dreamlitestream,
-  title   = {Video-Rate Streaming Stylization on the Smallest
-             Vision-Aware MLLM-Conditioned Edit Diffusion:
-             Periodic Cond-Refresh and Asymmetric Batched Inference
-             on Distilled UNet + MLLM TE},
-  author  = {Anonymous},
-  journal = {Transactions on Machine Learning Research},
+@misc{ootani2026videoratestreamingstylizationvisionaware,
+  title         = {Video-Rate Streaming Stylization on a Vision-Aware
+                   MLLM-Conditioned Edit Diffusion: Asymmetric Batched
+                   Inference on a Distilled UNet + MLLM Text Encoder},
+  author        = {Yoshiyuki Ootani},
+  year          = {2026},
+  eprint        = {2606.05981},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV},
+  url           = {https://arxiv.org/abs/2606.05981}
+}
+```
+
+If you specifically want to reference this code release rather than the
+paper, also cite the archived software deposit:
+
+```bibtex
+@software{ootani2026dreamlite_stream,
+  author  = {Ootani, Yoshiyuki},
+  title   = {dreamlite-stream: Video-Rate Streaming Stylization on a
+             Vision-Aware MLLM-Conditioned Edit Diffusion},
   year    = {2026},
-  note    = {Under review}
+  version = {v0.1.0-tcsvt-submission},
+  doi     = {10.5281/zenodo.20389428},
+  url     = {https://github.com/otanl/dreamlite-stream},
+  note    = {Companion code to arXiv:2606.05981}
 }
 ```
 
