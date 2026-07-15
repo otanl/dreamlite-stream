@@ -72,6 +72,7 @@ def main():
                    help="sample every Nth frame")
     p.add_argument("--max_frames_per_video", type=int, default=32)
     p.add_argument("--out_jsonl", default=str(_ROOT / "out" / "clip_similarity.jsonl"))
+    p.add_argument("--heldout_dir", default=str(_ROOT / "out" / "heldout_prompts_eval"))
     args = p.parse_args()
 
     print(f"[load] {args.clip_model}")
@@ -85,7 +86,7 @@ def main():
     for mp4 in sorted(champion_dir.glob("*.mp4")):
         jobs.append(("oilpaint", mp4.stem, str(mp4)))
 
-    heldout_dir = _ROOT / "out" / "heldout_prompts_eval"
+    heldout_dir = Path(args.heldout_dir)
     for mp4 in sorted(heldout_dir.glob("*_*.mp4")):
         stem = mp4.stem  # e.g. "comic_blackswan"
         tag, seq = stem.split("_", 1)

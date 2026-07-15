@@ -201,7 +201,7 @@ without rerunning. (Mp4 outputs themselves are not committed; see
   `down_blocks` after load-time subset filtering). The weights
   are Adapted Material of DreamLite-mobile and inherit
   DreamLite's CC BY-NC 4.0 weight licence. Mirrors:
-    - GitHub release: <https://github.com/otanl/dreamlite-stream/releases/tag/v0.1.0-tcsvt-submission>
+    - GitHub release: <https://github.com/otanl/dreamlite-stream/releases/tag/v0.1.0-preprint>
       (asset `temporal_lllite_step001440.safetensors`, SHA-256
       `88082c6bf56770469ad4ecbbca467b315ffcf4b5287fd17733751e2952fee7fc`).
     - HuggingFace: <https://huggingface.co/otnl/dreamlite-stream-temporal-lllite-v3>
@@ -257,7 +257,7 @@ paper, also cite the archived software deposit:
   title   = {dreamlite-stream: Video-Rate Streaming Stylization on a
              Vision-Aware MLLM-Conditioned Edit Diffusion},
   year    = {2026},
-  version = {v0.1.0-tcsvt-submission},
+  version = {v0.1.0-preprint},
   doi     = {10.5281/zenodo.20389428},
   url     = {https://github.com/otanl/dreamlite-stream},
   note    = {Companion code to arXiv:2606.05981}

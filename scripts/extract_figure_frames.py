@@ -18,7 +18,7 @@ GRID_OUT = _ROOT / "figures_for_paper" / "qualitative_grid"
 
 DAVIS = _ROOT / "assets" / "davis_mp4"
 CHAMPION = _ROOT / "out" / "champion" / "champion"  # oil-painting champion
-HELDOUT = _ROOT / "out" / "heldout_prompts_eval"
+HELDOUT = _ROOT / "out" / "heldout_prompts_eval_v3"
 
 # 4 styles + 1 input = 5 rows total in the grid
 STYLES = [

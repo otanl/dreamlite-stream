@@ -21,8 +21,10 @@ import torch
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DREAMLITE = _ROOT.parent / "dreamlite"
+_DREAMLITE_LLLITE = _ROOT.parent / "dreamlite-lllite" / "src"
 sys.path.insert(0, str(_ROOT / "src"))
 sys.path.insert(0, str(_DREAMLITE))
+sys.path.insert(0, str(_DREAMLITE_LLLITE))
 
 warnings.filterwarnings("ignore")
 

@@ -1,9 +1,10 @@
 cff-version: 1.2.0
 title: "dreamlite-stream"
-message: "If you use this software, please cite the TMLR submission below."
+message: "If you use this software, please cite the accompanying paper below."
 type: software
 authors:
-  - given-names: Anonymous
+  - given-names: Yoshiyuki
+    family-names: Ootani
 abstract: >-
   Video-rate streaming stylization runtime on the smallest
   vision-aware MLLM-conditioned edit-diffusion stack
@@ -16,11 +17,10 @@ license: Apache-2.0
 preferred-citation:
   type: article
   title: >-
-    Video-Rate Streaming Stylization on the Smallest Vision-Aware
-    MLLM-Conditioned Edit Diffusion: Periodic Cond-Refresh and
-    Asymmetric Batched Inference on Distilled UNet + MLLM TE
+    Inverting the Streaming-Diffusion Bottleneck: Video-Rate
+    MLLM-Conditioned Edit Diffusion on a Consumer GPU
   authors:
-    - given-names: Anonymous
-  journal: Transactions on Machine Learning Research
+    - given-names: Yoshiyuki
+      family-names: Ootani
   year: 2026
-  notes: Under review
+  notes: Preprint

@@ -44,6 +44,14 @@ warnings.filterwarnings("ignore")
 from dreamlite import DreamLiteMobilePipeline  # noqa: E402
 
 from dreamlite_stream import pipeline_ops as ops  # noqa: E402
+from dreamlite_stream.distillation_losses import (  # noqa: E402
+    DistillationLossConfig,
+    compute_distillation_loss,
+    preset_B3_baseline,
+    preset_O1_perceptual,
+    preset_O2_spectral,
+    preset_O3_main,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -152,9 +160,51 @@ def parse_args():
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--max_epochs", type=int, default=8)
+    p.add_argument(
+        "--max_steps", type=int, default=0,
+        help="If >0, cap total optimisation steps (overrides max_epochs). "
+             "Useful for short dry-runs."
+    )
     p.add_argument("--save_every", type=int, default=200)
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--seed", type=int, default=42)
+    # --- Distillation loss family (follow-up paper, see
+    # `notes/followup_design.md` §3.1 and
+    # `src/dreamlite_stream/distillation_losses.py`).  Default config
+    # matches the LCM-LoRA B2/B3 baseline (pure MSE).
+    p.add_argument(
+        "--loss_preset",
+        choices=("B3", "O1", "O2", "O3"),
+        default="B3",
+        help=(
+            "Loss configuration preset. B3 = pure MSE (baseline); "
+            "O1 = MSE + perceptual; O2 = MSE + spectral; "
+            "O3 = MSE + perceptual + spectral (main proposed config)."
+        ),
+    )
+    p.add_argument(
+        "--alpha_pixel", type=float, default=None,
+        help="Override alpha (pixel MSE coefficient). If unset, preset value is used.",
+    )
+    p.add_argument(
+        "--beta_perc", type=float, default=None,
+        help="Override beta (LPIPS perceptual coefficient).",
+    )
+    p.add_argument(
+        "--gamma_spec", type=float, default=None,
+        help="Override gamma (HF-FFT spectral coefficient).",
+    )
+    p.add_argument(
+        "--spec_on_pixel", action="store_true",
+        help="Compute HF-FFT loss on RGB pixels (default: latent).",
+    )
+    p.add_argument(
+        "--heavy_term_every_k", type=int, default=0,
+        help=(
+            "Compute LPIPS / pixel-spectral every k-th training step. "
+            "0 (default) = every step. Set higher to save compute."
+        ),
+    )
     return p.parse_args()
 
 
@@ -196,7 +246,11 @@ def main():
     )
     steps_per_epoch = max(1, len(ds) // (args.batch_size * args.gradient_accumulation_steps))
     max_steps = steps_per_epoch * args.max_epochs
-    print(f"[sched] {steps_per_epoch} opt-steps/epoch x {args.max_epochs} = {max_steps} steps")
+    if args.max_steps > 0:
+        max_steps = args.max_steps
+        print(f"[sched] {steps_per_epoch} opt-steps/epoch; --max_steps override -> {max_steps} steps")
+    else:
+        print(f"[sched] {steps_per_epoch} opt-steps/epoch x {args.max_epochs} = {max_steps} steps")
 
     optimizer = torch.optim.AdamW(lora_params, lr=args.learning_rate, betas=(0.9, 0.999))
     warmup = min(100, max(1, max_steps // 10))
@@ -207,6 +261,34 @@ def main():
     vae_scaling = vae.config.scaling_factor
     add_time_ids = torch.tensor([[args.size, args.size]] * args.batch_size,
                                 device=device, dtype=weight_dtype)
+
+    # ------------------------------------------------------------------
+    # Resolve distillation loss config (follow-up paper §3.1).
+    _preset_map = {
+        "B3": preset_B3_baseline,
+        "O1": preset_O1_perceptual,
+        "O2": preset_O2_spectral,
+        "O3": preset_O3_main,
+    }
+    loss_cfg: DistillationLossConfig = _preset_map[args.loss_preset]()
+    if args.alpha_pixel is not None:
+        loss_cfg.alpha_pixel = args.alpha_pixel
+    if args.beta_perc is not None:
+        loss_cfg.beta_perc = args.beta_perc
+    if args.gamma_spec is not None:
+        loss_cfg.gamma_spec = args.gamma_spec
+    if args.spec_on_pixel:
+        loss_cfg.spec_on_pixel = True
+    if args.heavy_term_every_k > 0:
+        loss_cfg.heavy_term_every_k_steps = args.heavy_term_every_k
+    print(
+        f"[loss] preset={args.loss_preset} "
+        f"alpha_pixel={loss_cfg.alpha_pixel} beta_perc={loss_cfg.beta_perc} "
+        f"gamma_spec={loss_cfg.gamma_spec} spec_on_pixel={loss_cfg.spec_on_pixel} "
+        f"heavy_every={loss_cfg.heavy_term_every_k_steps} "
+        f"needs_pixel_decode={loss_cfg.needs_pixel_decode}",
+        flush=True,
+    )
 
     step = 0
     micro = 0
@@ -269,7 +351,33 @@ def main():
                     return_dict=False,
                 )[0]
                 v_pred = v_pred[..., : target_latents.shape[-1]]
-                loss = F.mse_loss(v_pred.float(), v_target.float()) / args.gradient_accumulation_steps
+
+                # Distillation loss (follow-up). For B3 the pixel
+                # MSE term is the only active term and the behaviour
+                # matches the original `F.mse_loss(v_pred, v_target)`
+                # code path bit-for-bit. For O1/O2/O3 the perceptual /
+                # spectral terms are added on top; pixel decoding is
+                # only done when the active config requires it.
+                pix_s, pix_t = None, None
+                if loss_cfg.needs_pixel_decode:
+                    # Recover the predicted x_0 latent at t=1 from v.
+                    # v = noise - x_0  =>  x_0 = noise - v.
+                    x0_pred_latent = noise - v_pred
+                    pix_s = vae.decode(x0_pred_latent / vae_scaling).sample
+                    with torch.no_grad():
+                        pix_t = vae.decode(target_latents / vae_scaling).sample
+
+                loss_out = compute_distillation_loss(
+                    loss_cfg,
+                    student_v_pred=v_pred,
+                    target_v=v_target,
+                    student_pixels=pix_s,
+                    teacher_pixels=pix_t,
+                    student_latents=v_pred if not loss_cfg.spec_on_pixel else None,
+                    teacher_latents=v_target if not loss_cfg.spec_on_pixel else None,
+                    step=step,
+                )
+                loss = loss_out.total / args.gradient_accumulation_steps
 
             loss.backward()
             losses_window.append(loss.item() * args.gradient_accumulation_steps)

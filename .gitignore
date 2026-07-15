@@ -68,6 +68,10 @@ figures_for_paper/
 # correspondence). Not part of the public artefact.
 notes/
 
+# ===== Release upload artefacts (HF mirror staging) =====
+hf_upload/
+assets/demo_web.mp4
+
 # ===== TensorRT engine artefacts (host-specific) =====
 *.engine
 *.plan

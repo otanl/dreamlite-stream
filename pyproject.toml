@@ -9,7 +9,7 @@ description = "Video-rate streaming stylization runtime for DreamLite-mobile + Q
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Anonymous (TMLR submission)" }]
+authors = [{ name = "Yoshiyuki Ootani" }]
 keywords = ["diffusion", "video stylization", "real-time", "MLLM", "LLLite"]
 classifiers = [
     "Development Status :: 4 - Beta",
