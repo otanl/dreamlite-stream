@@ -3,7 +3,7 @@ speed and quality.
 
 Champion config (from v3 sweep):
     batched B=8 + 1-step + compile + pipelined
-    LLLite v3 with --lllite_blocks down_blocks  (54 hooks)
+    LLLite v3 with --lllite_blocks down_blocks  (38 hooks)
     --cond_refresh_every 8
 
 Reports per-sequence:
