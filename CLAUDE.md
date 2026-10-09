@@ -24,7 +24,7 @@ Three interpreters on this machine can run the code, and they are not interchang
 
 | Interpreter | Stack | Use for |
 |---|---|---|
-| WSL Ubuntu `/usr/bin/python3` (3.10) | torch 2.5.1+cu121, Linux triton | Where `out/champion/results.jsonl` was produced (its paths are `/mnt/f/...`); the live demo also runs here (WSLg, NDI) |
+| WSL Ubuntu `~/projects/venv/bin/python` (3.10) | torch 2.12.0+cu126, transformers 4.57, Linux triton 3.7, dreamlite-lllite installed | Where `out/champion/results.jsonl` was produced (its paths are `/mnt/f/...`); the live demo also runs here (WSLg, NDI). WSL's system `python3` cannot run the pipeline (its transformers predates Qwen3-VL) |
 | Windows bare `python` = `C:\Python314` | torch 2.11.0+cu128, transformers 5.2, diffusers 0.39 dev, triton-windows 3.7, sageattention, gemlite, hqq; no TensorRT | Current Windows work; the notes call this the main env |
 | `F:/work/dreamlite/.venv/Scripts/python.exe` (3.10) | torch 2.6.0+cu124, transformers 4.57, TensorRT 10.16, onnxruntime-gpu | Anything TensorRT / ONNX |
 
@@ -101,6 +101,12 @@ The UNet is compiled with `mode="reduce-overhead", dynamic=False`, i.e. captured
 - No host sync in the hot path; the padded-slice trick in `encode_prompt_edit_batch` exists to avoid one.
 - `_enable_compile` is a no-op if the UNet is already wrapped (`_orig_mod`). Build one worker and reuse it across sequences, resetting `state.frame_idx`, `_last_prev_decoded` and `_last_prev_input_gray` between them; a worker per sequence exhausts VRAM.
 - Long-running scripts raise `torch._dynamo.config.cache_size_limit` at import time to avoid recompile thrashing.
+
+### What the printed numbers measure
+
+- There are two throughput figures and they differ by about 2x on the shipped path. Step-only fps times `step_batch_with_prefetch`; loop fps also counts the `prefetch_batch(next)` call that runs on the same thread just before it (tokenisation, PIL preprocessing, and a text-encoder dispatch that blocks on host syncs). `BatchTiming.total_ms` is the step, `prefetch_ms` the prefetch call, `loop_ms` their sum. `champion_eval.py` (`fps` / `fps_loop`) and `sustained_throughput_test.py` report both; the other eval scripts still derive fps from `total_ms` alone, so theirs is step-only. Quote loop fps when judging a change.
+- `fixed_noise=True` reuses one `(B, C, h, w)` draw for every batch, so each batch slot keeps its own pattern and neighbouring frames still get different noise. It is not one pattern shared by all frames.
+- With `cond_refresh_every=8` and 64-frame clips, `champion_eval.py` sets the LLLite cond exactly once per clip, from the first batch's own input frames (there is no previous output yet), so those runs never feed a flow-warped previous output.
 
 ### Modules outside the main path
 
