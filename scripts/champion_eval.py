@@ -7,8 +7,10 @@ Champion config (from v3 sweep):
     --cond_refresh_every 8
 
 Reports per-sequence:
-    fps_step
-    L1 vs base 1-step (no-LLLite oil-paint reference)
+    fps        step-only: frames / time inside step_batch_with_prefetch
+    fps_loop   prefetch + step: also counts the time this thread spends in
+               prefetch_batch for each batch, i.e. what a caller of the loop
+               gets (video decode / encode by this script stay excluded)
     warp_err vs input
 """
 
@@ -137,10 +139,14 @@ def run_sequence(worker, args, seq_name: str, out_dir: Path):
     n_meas = sum(t.n_frames for t in timings)
     sum_total = sum(t.total_ms for t in timings)
     fps_step = n_meas / (sum_total / 1000)
+    # total_ms covers the step only. Each batch's prefetch call ran one
+    # iteration earlier on this same thread; loop_ms adds that back.
+    fps_loop = n_meas / (sum(t.loop_ms for t in timings) / 1000)
 
     return {
         "sequence": seq_name,
         "fps": fps_step,
+        "fps_loop": fps_loop,
         "n_frames": n_total,
         "out_path": str(out_path),
     }
@@ -220,18 +226,21 @@ def main():
         result["wall_s"] = elapsed
         rows.append(result)
         print(
-            f"  fps={result['fps']:5.2f}  warp_err={m.warping_error:5.2f}  "
+            f"  fps_loop={result['fps_loop']:5.2f}  fps_step={result['fps']:5.2f}  "
+            f"warp_err={m.warping_error:5.2f}  "
             f"con_l1={m.consecutive_l1:5.2f}  ratio={m.consistency_ratio:.3f}  "
             f"({elapsed:.0f}s)"
         )
 
     if rows:
         fpss = [r["fps"] for r in rows]
+        loops = [r["fps_loop"] for r in rows]
         wes = [r["warp_err"] for r in rows]
         print()
         print("=" * 70)
         print(
-            f"aggregate: fps {mean(fpss):.2f} ± {stdev(fpss) if len(fpss)>1 else 0:.2f}  "
+            f"aggregate: fps_loop {mean(loops):.2f} ± {stdev(loops) if len(loops)>1 else 0:.2f}  "
+            f"fps_step {mean(fpss):.2f} ± {stdev(fpss) if len(fpss)>1 else 0:.2f}  "
             f"warp_err {mean(wes):.2f} ± {stdev(wes) if len(wes)>1 else 0:.2f}  "
             f"N={len(rows)}"
         )

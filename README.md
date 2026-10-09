@@ -87,8 +87,13 @@ sequences from Table II of the paper:
 python scripts/champion_eval.py
 # Writes:
 #   out/champion/champion/<seq>.mp4
-#   out/champion/results.jsonl   (per-sequence fps + warp_err)
+#   out/champion/results.jsonl   (per-sequence fps, fps_loop + warp_err)
 ```
+
+Two rates are reported. `fps` times `step_batch_with_prefetch` alone
+(step-only). `fps_loop` also counts the time the same thread spends in
+`prefetch_batch` for each batch, so it is the rate a caller of the loop
+gets. `scripts/sustained_throughput_test.py` prints both as well.
 
 Single-clip inference:
 

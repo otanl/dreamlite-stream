@@ -40,10 +40,23 @@ class BatchTiming:
     vae_dec_ms: float = 0.0
     total_ms: float = 0.0
     n_frames: int = 0
+    # Wall time the caller was blocked inside the prefetch call that produced
+    # this batch's inputs. NOT part of total_ms: in a prefetch-then-step loop
+    # that call runs one iteration earlier, in front of the previous batch's
+    # step, so a step-only clock never sees it.
+    prefetch_ms: float = 0.0
 
     @property
     def per_frame_ms(self) -> float:
         return self.total_ms / max(self.n_frames, 1)
+
+    @property
+    def loop_ms(self) -> float:
+        """Caller-side cost of this batch in a prefetch-then-step loop.
+
+        Use this, not total_ms, for end-to-end throughput: frames / sum(loop_ms).
+        """
+        return self.total_ms + self.prefetch_ms
 
 
 @dataclass
@@ -67,6 +80,10 @@ class PrefetchedBatch:
     # on the future before calling set_cond_image so the CPU flow cost
     # overlaps with GPU TE/VAE_enc on the side stream.
     cond_rgbs_future: Optional[object] = None
+    # Wall time the producing call (prefetch_batch / prefetch_gpu_kick) held
+    # its caller: host-side preprocessing plus any host sync inside the TE
+    # forward. Copied into BatchTiming.prefetch_ms by the consuming step.
+    host_ms: float = 0.0
 
 
 @dataclass
@@ -357,6 +374,7 @@ class BatchedEditWorker:
         `torch.cuda.current_stream().wait_event(prefetched.done)` before
         reading the returned tensors.
         """
+        t_host = time.perf_counter()
         s = self.state
         B = len(frames)
         prompts = [s.prompt] * B
@@ -409,7 +427,10 @@ class BatchedEditWorker:
             ref = ops.encode_image_to_latent_batch(
                 self.pipeline, frames, s.height, s.width, self.device, self.dtype,
             )
-            return PrefetchedBatch(prompt_embeds=te, prompt_mask=mask, ref_latents=ref, n_frames=B)
+            return PrefetchedBatch(
+                prompt_embeds=te, prompt_mask=mask, ref_latents=ref, n_frames=B,
+                host_ms=(time.perf_counter() - t_host) * 1000,
+            )
 
         ev_start = torch.cuda.Event(enable_timing=True)
         ev_after_te = torch.cuda.Event(enable_timing=True)
@@ -462,6 +483,7 @@ class BatchedEditWorker:
             prompt_embeds=te, prompt_mask=mask, ref_latents=ref, n_frames=B,
             done=ev_done, ev_start=ev_start, ev_after_te=ev_after_te,
             cond_rgbs_future=cond_rgbs_future,
+            host_ms=(time.perf_counter() - t_host) * 1000,
         )
 
     # ------------------------------------------------------------------
@@ -632,7 +654,11 @@ class BatchedEditWorker:
         Must be called from the same thread that runs
         ``step_batch_with_prefetch`` so all CUDA-graph capture/replay
         happens from one thread.
+
+        ``host_ms`` on the result covers this call only; the CPU prep and
+        TE forward ran on the bg thread and did not hold the caller.
         """
+        t_host = time.perf_counter()
         B = cpu_prep["n_frames"]
 
         if self._side_stream is None:
@@ -648,6 +674,7 @@ class BatchedEditWorker:
             )
             return PrefetchedBatch(
                 prompt_embeds=te, prompt_mask=mask, ref_latents=ref, n_frames=B,
+                host_ms=(time.perf_counter() - t_host) * 1000,
             )
 
         ev_start = torch.cuda.Event(enable_timing=True)
@@ -683,6 +710,7 @@ class BatchedEditWorker:
             prompt_embeds=te, prompt_mask=mask, ref_latents=ref, n_frames=B,
             done=ev_done, ev_start=ev_start, ev_after_te=ev_after_te,
             cond_rgbs_future=cond_rgbs_future,
+            host_ms=(time.perf_counter() - t_host) * 1000,
         )
 
     @torch.no_grad()
@@ -695,7 +723,7 @@ class BatchedEditWorker:
         it overlaps with this denoise."""
         s = self.state
         B = len(frames)
-        timing = BatchTiming(n_frames=B)
+        timing = BatchTiming(n_frames=B, prefetch_ms=prefetched.host_ms)
         t0 = time.perf_counter()
 
         if prefetched.done is not None:
