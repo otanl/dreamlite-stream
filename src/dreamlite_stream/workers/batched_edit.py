@@ -599,14 +599,13 @@ class BatchedEditWorker:
             ev_te = torch.cuda.Event(enable_timing=False)
             with torch.cuda.stream(te_side):
                 tk_out = tk_out_cpu.to(self.device)
-                outputs = self.pipeline.text_encoder(
+                hidden_states = ops.prompt_hidden_state(
+                    self.pipeline.text_encoder,
                     input_ids=tk_out.input_ids,
                     attention_mask=tk_out.attention_mask,
                     pixel_values=tk_out.pixel_values,
                     image_grid_thw=tk_out.image_grid_thw,
-                    output_hidden_states=True,
                 )
-                hidden_states = outputs.hidden_states[-1]
                 te_raw = hidden_states[:, drop_idx:].to(dtype=self.dtype)
                 mask_raw = tk_out.attention_mask[:, drop_idx:].to(dtype=torch.long)
                 # When te_batch_one and B>1, broadcast (1,L,D) → (B,L,D).

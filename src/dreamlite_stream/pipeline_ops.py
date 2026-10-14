@@ -9,6 +9,7 @@ Bypasses pipeline.__call__ so we can:
 
 from __future__ import annotations
 
+import threading
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -86,6 +87,49 @@ def encode_prompt_edit(
     )
 
 
+# ---------------------------------------------------------------------------
+# Which hidden state is the prompt embedding
+# ---------------------------------------------------------------------------
+# DreamLite conditions on `hidden_states[-1]` of Qwen3-VL as transformers
+# 4.57 returns it (the version upstream pins): the output of the last decoder
+# layer BEFORE the language model's final norm. transformers 5 puts the
+# normed tensor in that slot instead. The UNet's prompt projection ends in an
+# RMSNorm, so nothing fails, but the conditioning is a different tensor (the
+# projected embeddings differ by about 70% in relative terms) and the output
+# changes with the installed transformers version. `prompt_hidden_state`
+# returns the pre-norm tensor on either version by recording the input of
+# that final norm during the forward.
+
+_PRENORM = threading.local()
+
+
+def _final_norm(text_encoder):
+    lm = getattr(getattr(text_encoder, "model", None), "language_model", None)
+    return getattr(lm, "norm", None)
+
+
+def _record_prenorm(_module, args):
+    _PRENORM.value = args[0]
+
+
+def prompt_hidden_state(text_encoder, **inputs) -> torch.Tensor:
+    """Run the text encoder and return the hidden state DreamLite is conditioned on.
+
+    Per-thread, so the demo's background text-encoder thread and the pipeline
+    thread do not see each other's tensors. Falls back to `hidden_states[-1]`
+    for an encoder without a `model.language_model.norm`.
+    """
+    norm = _final_norm(text_encoder)
+    if norm is not None and not getattr(norm, "_prompt_prenorm_hook", False):
+        norm.register_forward_pre_hook(_record_prenorm)
+        norm._prompt_prenorm_hook = True
+    _PRENORM.value = None
+    outputs = text_encoder(**inputs, output_hidden_states=True)
+    pre = getattr(_PRENORM, "value", None)
+    _PRENORM.value = None
+    return pre if pre is not None else outputs.hidden_states[-1]
+
+
 @torch.no_grad()
 def encode_prompt_edit_batch(
     pipeline,
@@ -137,14 +181,13 @@ def encode_prompt_edit_batch(
         padding="max_length", max_length=256, truncation=True,
         return_tensors="pt",
     ).to(device)
-    outputs = pipeline.text_encoder(
+    hidden_states = prompt_hidden_state(
+        pipeline.text_encoder,
         input_ids=tk_out.input_ids,
         attention_mask=tk_out.attention_mask,
         pixel_values=tk_out.pixel_values,
         image_grid_thw=tk_out.image_grid_thw,
-        output_hidden_states=True,
     )
-    hidden_states = outputs.hidden_states[-1]
 
     # NOTE: the original path here was
     #     split = pipeline._extract_masked_hidden(hidden_states, tk_out.attention_mask)
