@@ -91,6 +91,41 @@ weights distributed via `torchvision.models.optical_flow.raft_large`
 (`C_T_SKHT_V2`); see torchvision's license. RAFT itself is by
 [Teed and Deng, ECCV 2020](https://github.com/princeton-vl/RAFT).
 
+## RIFE (display-side frame interpolation)
+
+`src/dreamlite_stream/rife.py` contains the flow network of RIFE v4.25
+(`Head`, `ResConv`, `IFBlock`, `IFNet` and the warp), re-written for
+batched inference from `IFNet_HDv3.py` and `warplayer.py` of
+[Practical-RIFE](https://github.com/hzwer/Practical-RIFE) by Zhewei Huang
+et al., with parameter names kept so that the upstream checkpoint loads.
+RIFE is described in *Real-Time Intermediate Flow Estimation for Video
+Frame Interpolation*, ECCV 2022. **No RIFE weights are redistributed by
+this repository**; users download `flownet.pkl` from the upstream links.
+
+Practical-RIFE is released under the MIT License:
+
+> MIT License
+>
+> Copyright (c) 2021 hzwer
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all
+> copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+> SOFTWARE.
+
 ## LPIPS (Appendix B + spatial fidelity probes)
 
 The LPIPS spatial-fidelity probe uses
