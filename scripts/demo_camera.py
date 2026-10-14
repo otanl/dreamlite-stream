@@ -52,6 +52,13 @@ Performance optimisations beyond the paper's batched eval:
     encoder_hidden_states' sequence length constant across prompts so
     a live prompt change doesn't force torch.compile to re-record the
     captured CUDA graph mid-flight.
+  - ``--lean`` (see ``dreamlite_stream/lean.py``): the reduced per-batch
+    path. Prompt embedding encoded once and refreshed only on a prompt
+    change (``--te_refresh_every 0``), LLLite cond set once and held
+    (``--cond_refresh_every 0``), one init-noise draw shared by every
+    frame (``--shared_noise``), and the fp16 / channels_last compiled VAE
+    with uint8 I/O (``--fast_vae --vae_compile``). Each flag also works
+    on its own. Use ``--size`` to trade throughput for resolution.
 
 Latency: at source 30 fps with B=8 there is a one-batch-deep pipeline
 (~270 ms) plus the cam_q/display_q buffer (~1 batch combined). Live
@@ -105,6 +112,9 @@ from dreamlite_lllite import apply_lllite  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
 
 from dreamlite_stream import BatchedEditWorker, SharedState  # noqa: E402
+from dreamlite_stream.lean import (  # noqa: E402
+    add_lean_args, apply_onestep_lora, apply_trt_engine, lean_worker_kwargs, resolve_lean_args,
+)
 
 
 def parse_args():
@@ -116,7 +126,10 @@ def parse_args():
     p.add_argument("--camera", type=int, default=0)
     p.add_argument("--size", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--cond_refresh_every", type=int, default=8)
+    p.add_argument("--cond_refresh_every", type=int, default=None,
+                   help='Refresh the LLLite cond (flow + warp + cond CNN) every '
+                        'N batches. 0 = set it once at start-up and hold it. '
+                        'Default 8, or 0 with --lean.')
     p.add_argument("--lllite_blocks", default="down_blocks")
     p.add_argument("--steps", type=int, default=1)
     p.add_argument("--device", default="cuda")
@@ -142,12 +155,14 @@ def parse_args():
                    help='[deprecated] Use ~/.ndi/ndi-config.v1.json for NDI '
                         'discovery server config on Linux. Kept for back-compat; '
                         'no-op in current implementation.')
-    p.add_argument("--te_refresh_every", type=int, default=1,
+    p.add_argument("--te_refresh_every", type=int, default=None,
                    help='Recompute Q3-VL prompt_embeds only every N batches; '
                         'reuse cached embeds in between. At B=8 the TE forward '
                         'is ~250ms per batch on a 3090Ti — caching amortises '
                         'that, similar in spirit to --cond_refresh_every. '
-                        '1 = no caching, 8 = refresh once per second at 30fps.')
+                        '1 = no caching (default), 8 = refresh once per second '
+                        'at 30fps, 0 = encode once and refresh only when the '
+                        'prompt changes (default with --lean).')
     p.add_argument("--te_batch_one", action="store_true", default=False,
                    help='On TE refresh, run Q3-VL on a single representative '
                         'frame (frames[0]) and broadcast embeds to the full '
@@ -156,13 +171,13 @@ def parse_args():
                         "since per-frame image-aware conditioning is already "
                         'being amortised by the cache.')
     p.add_argument("--fixed_noise", action="store_true", default=False,
-                   help='Use the SAME init noise pattern for every frame '
-                        '(seed_offset stays at 0 instead of advancing with '
-                        's.frame_idx). Removes per-frame stochastic variation '
-                        "in the denoise initial latents, so per-frame output "
-                        'drift comes purely from input changes — useful for '
-                        'isolating whether observed flicker is from input '
-                        'sensor noise or from the diffusion noise pattern.')
+                   help='Reuse the same (B, C, h, w) init-noise tensor for '
+                        'every batch (seed_offset stays at 0 instead of '
+                        'advancing with s.frame_idx). Each of the B slots '
+                        'keeps its own pattern, so neighbouring frames still '
+                        'get different noise and a static scene still '
+                        'flickers with period B. For one pattern shared by '
+                        'every frame use --shared_noise.')
     p.add_argument("--interp_factor", type=int, default=1,
                    help='Display-side frame interpolation factor. 1 = off; '
                         '2 inserts one intermediate frame between each pair '
@@ -174,20 +189,20 @@ def parse_args():
                    choices=["linear", "rife"],
                    help='Interpolation method used when --interp_factor > 1. '
                         '"linear" (default) blends pixels; cheap, mild '
-                        'ghosting on fast motion. "rife" calls Practical-'
-                        'RIFE on each pair (better motion quality, ~5-15 ms '
-                        'per pair on a 3090 Ti). For "rife" you must also '
-                        'pass --rife_path (and optionally --rife_model).')
-    p.add_argument("--rife_path", default=None,
-                   help='Directory of a Practical-RIFE checkout '
-                        '(https://github.com/hzwer/Practical-RIFE), added to '
-                        'sys.path so the model module is importable. '
+                        'ghosting on fast motion. "rife" runs the RIFE v4.25 '
+                        'flow network on the whole batch in one call '
+                        '(dreamlite_stream/rife.py); the input side of the '
+                        'view stays a linear blend. Needs --rife_weights or '
+                        '--rife_engine.')
+    p.add_argument("--rife_weights",
+                   default=str(_ROOT / "data" / "rife" / "v4.25" / "flownet.pkl"),
+                   help='RIFE v4.25 checkpoint: flownet.pkl from the download '
+                        'linked in https://github.com/hzwer/Practical-RIFE. '
                         'Only used when --interp_method=rife.')
-    p.add_argument("--rife_model", default=None,
-                   help='Path to a Practical-RIFE checkpoint directory or '
-                        '.pkl file (e.g. train_log/RIFE_HDv3.pkl from the '
-                        'Practical-RIFE Google-Drive download). If omitted, '
-                        'defaults to <rife_path>/train_log.')
+    p.add_argument("--rife_engine", default=None,
+                   help='TensorRT engine of the RIFE network from '
+                        'scripts/build_trt_rife.py, built for this --size and '
+                        '--batch_size. Replaces the PyTorch network.')
     p.add_argument("--temporal_blend_alpha", type=float, default=0.0,
                    help='Display-side temporal alpha blend: smooths each '
                         'output toward its predecessor by alpha in [0, 0.95]. '
@@ -206,7 +221,9 @@ def parse_args():
     p.add_argument("--save_dir", default=str(_ROOT / "out" / "demo"))
     p.add_argument("--verbose_timing", action="store_true",
                    help="Print per-batch collect/prefetch/step timings to console")
-    return p.parse_args()
+    # --te_refresh_every / --te_batch_one are defined above with demo-specific help.
+    add_lean_args(p, te_args=False)
+    return resolve_lean_args(p.parse_args())
 
 
 def load_pipeline_with_quant_te(model_path: str, quant: str, device: str):
@@ -715,7 +732,7 @@ def pipeline_loop(
             # we discard the OLDEST queued output batch rather than block
             # the pipeline. Blocking on put inflates iter_dur (because
             # last_iter_end is set before this call), which feeds back into
-            # fps_smoothed → per_frame_ms grows → display gets even slower
+            # fps_smoothed → the display paces slower → display gets even slower
             # → runaway. Dropping keeps the pipeline at steady state.
             try:
                 display_q.put_nowait((bgrs_cur, outputs, iter_dur))
@@ -753,23 +770,30 @@ def main():
     pipeline, runtime_dtype = load_pipeline_with_quant_te(
         args.model, args.quant_te, args.device,
     )
+    apply_onestep_lora(pipeline, args)
 
     vae_downsample = 2 ** (len(pipeline.vae.config.encoder_block_out_channels) - 1)
     latent_hw = args.size // vae_downsample
     block_filter = [s.strip() for s in args.lllite_blocks.split(",")] if args.lllite_blocks else None
-    controller = apply_lllite(
-        pipeline.unet, cond_emb_dim=32, mlp_dim=64,
-        cond_image_size=args.size, sample_size=latent_hw,
-        inference_mode=True, max_batch_size=args.batch_size,
-        block_filter=block_filter,
-    )
-    sd = load_file(args.lllite_weights)
-    controller.load_state_dict(sd, strict=False)
-    controller.to(device=args.device, dtype=runtime_dtype)
-    controller.eval()
-    controller.set_multiplier(1.0)
-    print(f"[lllite] {len(controller.modules_dict)} hooks ({args.lllite_blocks}), "
-          f"dtype={runtime_dtype}")
+    if args.lllite_multiplier != 0:
+        controller = apply_lllite(
+            pipeline.unet, cond_emb_dim=32, mlp_dim=64,
+            cond_image_size=args.size, sample_size=latent_hw,
+            inference_mode=True, max_batch_size=args.batch_size,
+            block_filter=block_filter,
+        )
+        sd = load_file(args.lllite_weights)
+        controller.load_state_dict(sd, strict=False)
+        controller.to(device=args.device, dtype=runtime_dtype)
+        controller.eval()
+        controller.set_multiplier(args.lllite_multiplier)
+        print(f"[lllite] {len(controller.modules_dict)} hooks ({args.lllite_blocks}), "
+              f"dtype={runtime_dtype}, multiplier={args.lllite_multiplier}")
+    else:
+        # Multiplier 0 means no adapter: attach nothing, rather than hooks that add zero.
+        controller = None
+        print("[lllite] off (--lllite_multiplier 0): adapter not attached")
+    apply_trt_engine(pipeline, args, controller)
 
     state = SharedState(
         height=args.size, width=args.size,
@@ -780,11 +804,16 @@ def main():
         device=args.device, dtype=runtime_dtype, seed=args.seed,
         compile=args.compile, compile_mode=args.compile_mode,
         lllite_controller=controller,
-        cond_refresh_every=args.cond_refresh_every,
-        te_refresh_every=args.te_refresh_every,
-        te_batch_one=args.te_batch_one,
         fixed_noise=args.fixed_noise,
         cond_flow_workers=8,
+        **lean_worker_kwargs(args),
+    )
+    print(
+        f"[config] size={args.size}  te_refresh_every={args.te_refresh_every} "
+        f"te_batch_one={args.te_batch_one}  cond_refresh_every={args.cond_refresh_every}  "
+        f"shared_noise={args.shared_noise}  fast_vae={args.fast_vae} "
+        f"vae_compile={args.vae_compile}  onestep_lora={'yes' if args.onestep_lora else 'no'}  "
+        f"trt_engine={'yes' if args.trt_engine else 'no'}"
     )
 
     use_ndi = args.ndi_source is not None
@@ -890,12 +919,25 @@ def main():
     # (kept as the *blended* version so seeding into the next batch
     # preserves continuity).
     prev_blended_bgr: "np.ndarray | None" = None
-    # Lazy-loaded RIFE model (None until first frame if --interp_method=rife).
-    # If load fails (e.g. --rife_path missing or pointing at a non-Practical-
-    # RIFE directory) we fall back to linear interpolation and remember to
-    # not retry every frame.
-    _rife_model = None
-    _rife_disabled = False
+    # RIFE interpolator for the output side (None = linear blending). If it
+    # cannot be set up (missing weights, engine built for another size) the
+    # session falls back to linear interpolation instead of stopping.
+    rife_interp = None
+    in_carry = None
+    if args.interp_factor > 1 and args.interp_method == "rife":
+        try:
+            from dreamlite_stream.rife import LinearCarry, RIFEInterpolator
+            rife_interp = RIFEInterpolator(
+                weights=args.rife_weights, engine=args.rife_engine, device=args.device,
+            )
+            in_carry = LinearCarry()
+            print(f"[rife] {rife_interp.backend} backend, x{args.interp_factor} display rate", flush=True)
+        except Exception as e:
+            print(
+                f"[rife] WARN: could not set up RIFE ({e}). Using "
+                "--interp_method=linear for this session.",
+                flush=True,
+            )
 
     try:
         while not stop_event.is_set():
@@ -906,6 +948,7 @@ def main():
                 if k == ord("q"):
                     stop_event.set()
                 continue
+            t_batch = time.perf_counter()
 
             # iter_dur = full pipeline iteration time (collect + prefetch +
             # step). This is the rate at which new batches arrive, so display
@@ -937,71 +980,40 @@ def main():
                 prev_blended_bgr = out_bgrs[-1] if out_bgrs else prev_blended_bgr
 
             # Display-side frame interpolation: insert (interp_factor-1)
-            # intermediates between each consecutive (in, out) pair.
-            # Pipeline throughput is unchanged; this only affects pacing on
-            # the display side. The input side always uses linear (camera
-            # motion is the ground truth — no need for learned interp);
-            # the output side uses RIFE when --interp_method=rife is set,
-            # otherwise linear.
+            # intermediates before each frame. This only affects pacing on
+            # the display side. With RIFE the whole batch goes through the
+            # flow network in one call and the pair across the batch
+            # boundary is interpolated too; the input side gets linear
+            # blends with the same frame count (camera motion is the ground
+            # truth, no need for learned interpolation there).
             if args.interp_factor > 1:
                 from dreamlite_stream.frame_interp import expand_linear
-                in_bgrs = expand_linear(in_bgrs, args.interp_factor)
-                use_rife = (
-                    args.interp_method == "rife" and not _rife_disabled
-                )
-                if use_rife and _rife_model is None:
-                    # First batch with RIFE requested → try to load. Catch
-                    # any failure (missing repo, missing checkpoint, wrong
-                    # path) and fall back to linear instead of crashing.
-                    from dreamlite_stream.frame_interp import _load_rife
+                if rife_interp is not None:
                     try:
-                        if not args.rife_path:
-                            raise RuntimeError(
-                                "--rife_path PATH is required for "
-                                "--interp_method=rife"
-                            )
-                        rife_model_arg = args.rife_model or args.rife_path
-                        _rife_model = _load_rife(
-                            rife_model_arg, args.rife_path, args.device,
-                        )
-                        print(
-                            f"[rife] loaded model from {rife_model_arg} "
-                            f"(repo: {args.rife_path})",
-                            flush=True,
-                        )
-                    except Exception as e:
-                        print(
-                            f"[rife] WARN: load failed ({e}). Falling back "
-                            "to --interp_method=linear for the rest of "
-                            "this session.",
-                            flush=True,
-                        )
-                        _rife_disabled = True
-                        use_rife = False
-                if use_rife and _rife_model is not None:
-                    from dreamlite_stream.frame_interp import expand_rife
-                    try:
-                        out_bgrs = expand_rife(
-                            out_bgrs, args.interp_factor,
-                            _rife_model, args.device,
-                        )
+                        out_bgrs = list(rife_interp.expand(out_bgrs, args.interp_factor, bgr=True))
+                        in_bgrs = in_carry.expand(in_bgrs, args.interp_factor)
                     except Exception as e:
                         print(
                             f"[rife] WARN: inference failed ({e}). Falling "
                             "back to linear for the rest of this session.",
                             flush=True,
                         )
-                        _rife_disabled = True
-                        out_bgrs = expand_linear(out_bgrs, args.interp_factor)
-                else:
+                        rife_interp = None
+                if rife_interp is None:
+                    in_bgrs = expand_linear(in_bgrs, args.interp_factor)
                     out_bgrs = expand_linear(out_bgrs, args.interp_factor)
 
-            # Pace at pipeline rate × interp factor so the expanded sequence
-            # fits the same iter_dur window. 1 frame = batch_dur/B/interp sec.
-            effective_fps = fps_smoothed * max(1, args.interp_factor)
-            per_frame_ms = max(
-                5, min(120, int(round(1000.0 / max(effective_fps, 1))))
-            )
+            # Pace by deadline. Everything shown for this batch, including the
+            # conversions and interpolation above and each frame's draw time,
+            # has to fit in one pipeline iteration; otherwise display_q
+            # (maxsize 1, drop-oldest) starts dropping whole batches. A fixed
+            # wait per frame on top of the draw time always runs behind. The
+            # 3% margin keeps the display slightly ahead, so it idles on the
+            # queue for a moment instead of dropping.
+            n_show = max(1, min(len(in_bgrs), len(out_bgrs)))
+            budget = 0.97 * args.batch_size / max(fps_smoothed, 1e-6)
+            period = max(0.001, (budget - (time.perf_counter() - t_batch)) / n_show)
+            t_due = time.perf_counter()
 
             for in_bgr, out_bgr in zip(in_bgrs, out_bgrs):
                 sxs = np.concatenate([in_bgr, out_bgr], axis=1)
@@ -1011,7 +1023,9 @@ def main():
                     f"fps {fps_smoothed:5.1f}    prompt: {args.prompt[:60]}",
                 ])
                 cv2.imshow(win_name, sxs)
-                k = cv2.waitKey(per_frame_ms) & 0xFF
+                t_due += period
+                wait_ms = max(1, min(120, int((t_due - time.perf_counter()) * 1000)))
+                k = cv2.waitKey(wait_ms) & 0xFF
                 if k == ord("q"):
                     stop_event.set()
                     break
