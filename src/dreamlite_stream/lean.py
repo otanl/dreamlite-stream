@@ -79,6 +79,13 @@ def add_lean_args(p: argparse.ArgumentParser, *, te_args: bool = True) -> None:
                         "output. Trained for one --size and --seed and for the "
                         "shared-noise setting; use with --lean. No run-time "
                         "cost: the weights are merged.")
+    g.add_argument("--init_noise", default=None, metavar="FILE",
+                   help="Use the init-noise tensor stored in FILE (a one-step "
+                        "LoRA, or the .noise.safetensors next to a TensorRT "
+                        "engine) as the shared noise instead of drawing one "
+                        "from --seed. --onestep_lora and --trt_engine do this "
+                        "by themselves; pass it alone to run the base model on "
+                        "the noise a LoRA was fitted to.")
     g.add_argument("--lllite_multiplier", type=float, default=None,
                    help="Scale of the Temporal LLLite adapter's residuals. "
                         "1.0 = as trained (default). 0 = no adapter: its "
@@ -138,7 +145,21 @@ def lean_worker_kwargs(args: argparse.Namespace) -> dict:
         "fast_vae": bool(getattr(args, "fast_vae", False)),
         "vae_compile": bool(getattr(args, "vae_compile", False)),
         "output_type": "np" if getattr(args, "fast_vae", False) else "pil",
+        "init_noise": _init_noise_tensor(args),
     }
+
+
+def _init_noise_tensor(args: argparse.Namespace):
+    """The shared init-noise tensor for this run, or None to draw one from the seed.
+
+    An explicit ``--init_noise FILE`` wins; otherwise the tensor a merged
+    LoRA or a TensorRT engine brought along (set by the apply_* helpers).
+    """
+    path = getattr(args, "init_noise", None)
+    if path:
+        from . import onestep_lora
+        return onestep_lora.load_init_noise(path)
+    return getattr(args, "init_noise_tensor", None)
 
 
 def apply_onestep_lora(pipeline, args: argparse.Namespace):
@@ -160,15 +181,18 @@ def apply_onestep_lora(pipeline, args: argparse.Namespace):
 
     state, meta = onestep_lora.load(path)
     handle = onestep_lora.merge(pipeline.unet, state, meta)
+    noise = onestep_lora.init_noise(state)
+    args.init_noise_tensor = noise        # the worker's shared noise, via lean_worker_kwargs
+    noise_src = "from the file" if noise is not None else f"not stored, seed {meta.get('seed')}"
     print(
         f"[onestep_lora] merged {handle.n_layers} layers from {path} "
-        f"(trained at {meta.get('size')}px, seed {meta.get('seed')}, "
-        f"{meta.get('teacher_steps')}-step teacher, {len(meta.get('prompts') or [])} prompts)"
+        f"(trained at {meta.get('size')}px, {meta.get('teacher_steps')}-step teacher, "
+        f"{len(meta.get('prompts') or [])} prompts; init noise {noise_src})"
     )
     for note in onestep_lora.compatibility_notes(
         meta, size=args.size, seed=getattr(args, "seed", None),
         steps=getattr(args, "steps", 1), shared_noise=bool(getattr(args, "shared_noise", False)),
-        prompt=getattr(args, "prompt", None),
+        prompt=getattr(args, "prompt", None), has_noise=noise is not None,
     ):
         print(f"[onestep_lora] note: {note}")
     return handle
@@ -206,14 +230,23 @@ def apply_trt_engine(pipeline, args: argparse.Namespace, controller=None):
         f"one-step LoRA: {spec.onestep_lora or 'none'}; "
         f"adapter: {f'x{spec.lllite_multiplier:g}' if spec.has_lllite else 'not in the engine'})"
     )
+    noise_file = noise_path_for(path)
+    noise = onestep_lora.load_init_noise(noise_file) if noise_file.exists() else None
+    args.init_noise_tensor = noise        # the worker's shared noise, via lean_worker_kwargs
     if spec.onestep_lora_meta:
         for note in onestep_lora.compatibility_notes(
             spec.onestep_lora_meta, size=args.size, seed=getattr(args, "seed", None),
             steps=getattr(args, "steps", 1), shared_noise=bool(getattr(args, "shared_noise", False)),
-            prompt=getattr(args, "prompt", None),
+            prompt=getattr(args, "prompt", None), has_noise=noise is not None,
         ):
-            print(f"[trt] note: the engine's one-step LoRA was {note}")
+            print(f"[trt] note: the engine's one-step LoRA: {note}")
     return engine
+
+
+def noise_path_for(engine_path):
+    """Where a TensorRT engine keeps the init-noise tensor of the LoRA built into it."""
+    from pathlib import Path
+    return Path(engine_path).with_suffix(".noise.safetensors")
 
 
 def holds_clip_state(args: argparse.Namespace) -> bool:

@@ -120,6 +120,10 @@ class BatchedEditWorker:
     # shared_noise removes that difference too. On a static input the
     # output is then identical from frame to frame.
     shared_noise: bool = False
+    # The shared pattern itself, shape (1, C, h, w), used in place of a draw
+    # when shared_noise is on. A one-step LoRA is fitted to one such tensor
+    # and carries it in its file.
+    init_noise: Optional[torch.Tensor] = None
     # Refresh the LLLite cond_emb buffer only every N batches; reuse the
     # previous embedding in between. Hides the 108-hook CNN cost when N>1
     # without retraining (the previous cond is a good approximation when
@@ -454,13 +458,23 @@ class BatchedEditWorker:
             vae_scale = self.pipeline.vae_scale_factor
             lat_hw = (s.height // vae_scale, s.width // vae_scale)
             if cached is None or tuple(cached.shape[-2:]) != lat_hw:
-                gen = None
-                if self.seed is not None:
-                    gen = torch.Generator(device="cpu").manual_seed(self.seed)
-                cached = ops.make_init_noise(
-                    self.pipeline, height=s.height, width=s.width,
-                    device=self.device, dtype=self.dtype, generator=gen, batch_size=1,
-                )
+                if self.init_noise is not None:
+                    if tuple(self.init_noise.shape[-2:]) != lat_hw:
+                        raise ValueError(
+                            f"init_noise is a {tuple(self.init_noise.shape[-2:])} latent but the worker "
+                            f"runs {lat_hw}; it belongs to another resolution")
+                    cached = self.init_noise.to(device=self.device, dtype=self.dtype)
+                else:
+                    gen = None
+                    if self.seed is not None:
+                        gen = torch.Generator(device="cpu").manual_seed(self.seed)
+                    # Drawn in fp32 so that a seed gives the same pattern on
+                    # every torch build (see ops.make_init_noise).
+                    cached = ops.make_init_noise(
+                        self.pipeline, height=s.height, width=s.width,
+                        device=self.device, dtype=self.dtype, generator=gen, batch_size=1,
+                        draw_dtype=torch.float32,
+                    )
                 self._shared_noise_cache = cached
             # .contiguous() materialises a fresh B-major tensor per call, so
             # the compiled UNet never sees a stride-0 broadcast view.

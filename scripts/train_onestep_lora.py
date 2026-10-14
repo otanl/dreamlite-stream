@@ -14,8 +14,10 @@ The pixel-space perceptual term is what keeps the result sharp; latent L2
 alone is the documented cause of blur in one-step students. Nothing is
 trained except the LoRA, and the base UNet stays in bf16.
 
-The LoRA is tied to the resolution (--size) and noise seed (--seed) it was
-trained with, and to the prompts it saw. Train one per resolution.
+The LoRA is tied to the resolution (--size) and the init-noise tensor it was
+trained with, and to the prompts it saw. Train one per resolution. The noise
+tensor is drawn from --seed and stored in the file, so the LoRA does not
+depend on a later run drawing the same tensor again.
 
 Data: frames from any folders of clips (--clips_dirs). Each clip is paired
 with a few of the prompts; the prompt embedding is taken from the clip's
@@ -165,10 +167,11 @@ class Trainer:
         s = args.size
         self.lat = s // self.pipe.vae_scale_factor
         self.tid = ops.make_time_ids(s, s, DEV, BF16)
-        # Exactly the tensor BatchedEditWorker(shared_noise=True, seed=...) draws.
+        # The tensor BatchedEditWorker(shared_noise=True, seed=...) draws. It is
+        # saved with the LoRA, and --eval_only replaces it by the saved one.
         gen = torch.Generator(device="cpu").manual_seed(args.seed)
         self.eps = ops.make_init_noise(self.pipe, height=s, width=s, device=DEV, dtype=BF16,
-                                       generator=gen, batch_size=1)
+                                       generator=gen, batch_size=1, draw_dtype=torch.float32)
         self.ts1 = self.sched(1)[0]
         self.wrappers = {}
 
@@ -237,6 +240,7 @@ class Trainer:
             "fpc": a.frames_per_clip, "stride": a.frame_stride, "data_seed": a.data_seed,
             # targets depend on which hidden state is the prompt embedding (pipeline_ops.prompt_hidden_state)
             "prompt_hidden": "pre-norm",
+            "noise_draw": "fp32",
         }, sort_keys=True).encode()).hexdigest()[:12]
         cache = Path(a.cache_dir) / f"dataset_{key}.pt"
         if cache.exists():
@@ -473,7 +477,11 @@ def main():
                 raise SystemExit(f"{path} was trained with {k}={meta.get(k)}, not {getattr(args, k)}")
         args.prompts = meta["prompts"]
         print(f"[config] eval only: {path}", flush=True)
-        final_eval(Trainer(args), args, state, meta, out_dir)
+        tr = Trainer(args)
+        noise = onestep_lora.init_noise(state)
+        if noise is not None:
+            tr.eps = noise.to(DEV, BF16)    # the tensor it was fitted to, whatever this build would draw
+        final_eval(tr, args, state, meta, out_dir)
         return
 
     (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
@@ -490,6 +498,7 @@ def main():
     seconds = tr.train(data, quick, out_dir / "log.jsonl")
 
     state = onestep_lora.state_from_wrappers(tr.wrappers)
+    state[onestep_lora.NOISE_KEY] = tr.eps.detach().float().cpu().contiguous()
     meta = dict(format="dreamlite-stream/onestep-lora/1", base="DreamLite-mobile", size=args.size, seed=args.seed,
                 teacher_steps=args.teacher_steps, rank=args.rank, alpha=args.alpha, targets=args.targets,
                 prompts=args.prompts, train_steps=args.steps, train_pairs=int(data["refs"].shape[0]),

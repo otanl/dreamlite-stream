@@ -31,7 +31,9 @@ Then:
         --trt_engine out/trt/unet_768_b8_lora_lllite.engine
 
 Outputs (default out/trt/): <name>.onnx, <name>.check.safetensors,
-<name>.export.json, <name>.engine, <name>.json (the engine's spec).
+<name>.export.json, <name>.noise.safetensors (the init noise of the LoRA,
+which the runtime uses as the shared noise), <name>.engine and <name>.json
+(the engine's spec).
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ sys.path.insert(0, str(_LLLITE / "src"))
 
 warnings.filterwarnings("ignore")
 
+from dreamlite_stream.lean import noise_path_for  # noqa: E402
 from dreamlite_stream.trt_engine import (  # noqa: E402
     BASE_INPUTS, EngineSpec, cond_input_name, file_sha256,
 )
@@ -159,8 +162,19 @@ def export(args, onnx_path: Path, check_path: Path, meta_path: Path) -> None:
     emb, mask = ops.encode_prompt_edit_batch(pipe, [args.prompt], frames[:1], DEV, torch.bfloat16)
     emb, mask = emb.expand(B, -1, -1).float().contiguous(), mask.expand(B, -1).contiguous()
     ref_lat = ops.encode_image_to_latent_batch(pipe, frames, size, size, DEV, torch.bfloat16).float()
-    eps = ops.make_init_noise(pipe, height=size, width=size, device=DEV, dtype=torch.float32,
-                              generator=torch.Generator(device="cpu").manual_seed(args.seed), batch_size=1)
+    # The check runs on the noise the engine will see: the LoRA's own tensor when it has one.
+    state = meta = lora_noise = None
+    if args.onestep_lora:
+        state, meta = onestep_lora.load(args.onestep_lora)
+        lora_noise = onestep_lora.init_noise(state)
+    noise_path = noise_path_for(onnx_path)
+    if lora_noise is not None:
+        save_file({onestep_lora.NOISE_KEY: lora_noise.contiguous()}, str(noise_path))
+        eps = lora_noise.to(DEV, torch.float32)
+    else:
+        noise_path.unlink(missing_ok=True)
+        eps = ops.make_init_noise(pipe, height=size, width=size, device=DEV, dtype=torch.float32,
+                                  generator=torch.Generator(device="cpu").manual_seed(args.seed), batch_size=1)
     x = torch.cat([eps.expand(B, -1, -1, -1), ref_lat], dim=3).contiguous()
     ts, _ = ops.set_timesteps(pipe, size, size, 1, DEV)
     t = ts[0].expand(B).float().contiguous()
@@ -173,11 +187,11 @@ def export(args, onnx_path: Path, check_path: Path, meta_path: Path) -> None:
     req = requested_export(args)
     lora_meta = None
     if args.onestep_lora:
-        state, meta = onestep_lora.load(args.onestep_lora)
         handle = onestep_lora.merge(unet, state, meta)
         lora_meta = {k: meta.get(k) for k in ("size", "seed", "teacher_steps", "prompts")}
         print(f"[export] merged one-step LoRA: {handle.n_layers} layers from {args.onestep_lora}", flush=True)
-        for note in onestep_lora.compatibility_notes(meta, size=size, seed=args.seed, steps=1, shared_noise=True):
+        for note in onestep_lora.compatibility_notes(meta, size=size, seed=args.seed, steps=1, shared_noise=True,
+                                                     has_noise=lora_noise is not None):
             print(f"[export] note: {note}", flush=True)
 
     hooks, hook_names = [], []
@@ -226,7 +240,7 @@ def export(args, onnx_path: Path, check_path: Path, meta_path: Path) -> None:
     check = {n: v.cpu().contiguous() for n, v in zip(names, inputs)}
     check["ref32"] = ref32.cpu().contiguous()
     save_file(check, str(check_path))
-    meta_path.write_text(json.dumps({**req, "onestep_lora_meta": lora_meta,
+    meta_path.write_text(json.dumps({**req, "onestep_lora_meta": lora_meta, "has_init_noise": lora_noise is not None,
                                      "seq_len": int(proj.shape[1]), "hook_names": hook_names,
                                      "pytorch_fp16_rel_err": err16}, indent=2), encoding="utf-8")
     del pipe, unet, model, plain
@@ -342,7 +356,8 @@ def main():
     req = requested_export(args)
     have = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else None
     reuse = (not args.force and have is not None and onnx_path.exists() and check_path.exists()
-             and all(have.get(k) == v for k, v in req.items()))
+             and all(have.get(k) == v for k, v in req.items())
+             and (noise_path_for(engine_path).exists() or not have.get("has_init_noise")))
     if reuse:
         print(f"[export] reusing {onnx_path.name}", flush=True)
     else:

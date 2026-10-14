@@ -329,13 +329,26 @@ def make_init_noise(
     dtype,
     generator: Optional[torch.Generator] = None,
     batch_size: int = 1,
+    draw_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
+    """Init noise for `batch_size` frames.
+
+    With a generator the draw happens on the CPU in `dtype`, or in
+    `draw_dtype` and then cast when that is given. A seeded draw made
+    directly in bf16 or fp16 is not the same tensor on every torch build
+    (2.6 and 2.11 on Windows agree with each other; 2.12 on Linux gives an
+    unrelated one), whereas the fp32 stream is the same on all of them.
+    Callers that need one seed to mean one picture everywhere pass
+    `draw_dtype=torch.float32`; the default keeps existing outputs as they are.
+    """
     vae_scale = pipeline.vae_scale_factor
     lat_h, lat_w = height // vae_scale, width // vae_scale
     num_channels = pipeline.vae.config.latent_channels
     shape = (batch_size, num_channels, lat_h, lat_w)
     # Generate on CPU when a generator is provided (cheap, deterministic, then ship).
     if generator is not None:
+        if draw_dtype is not None and draw_dtype != dtype:
+            return torch.randn(shape, generator=generator, dtype=draw_dtype).to(device=device, dtype=dtype)
         return torch.randn(shape, generator=generator, dtype=dtype).to(device)
     return torch.randn(shape, device=device, dtype=dtype)
 

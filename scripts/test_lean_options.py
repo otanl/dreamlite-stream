@@ -15,6 +15,8 @@ Verifies, without loading any model weights:
 6. `BatchTiming.loop_ms` adds the prefetch time to the step time.
 7. `--trt_engine`: the engine's spec supplies the adapter multiplier when
    none is given, and a spec reports every way it does not fit a run.
+8. `init_noise`: a given tensor replaces the shared-noise draw, a tensor for
+   another resolution is refused, and `--init_noise FILE` reaches the worker.
 
 Runs on CPU in a few seconds; no GPU needed.
 """
@@ -131,6 +133,45 @@ def test_shared_noise_is_one_pattern():
     w.state.height = w.state.width = 128
     assert w._make_init_latents(2).shape == (2, 4, 16, 16)
     print("[OK] shared_noise: one pattern for every frame of every batch")
+
+
+def test_init_noise_tensor():
+    given = torch.arange(4 * 8 * 8, dtype=torch.float32).reshape(1, 4, 8, 8)
+    w = _worker(shared_noise=True, init_noise=given)
+    a = w._make_init_latents(4)
+    assert a.shape == (4, 4, 8, 8) and all(torch.equal(a[i], given[0]) for i in range(4))
+    w.seed = 7                                   # the seed plays no part once a tensor is given
+    w.reset_sequence()
+    assert torch.equal(w._make_init_latents(2)[1], given[0])
+    # Without shared_noise the tensor is not consulted.
+    assert not torch.equal(_worker(init_noise=given)._make_init_latents(4)[0], given[0])
+    # A tensor for another resolution is an error, not a silent redraw.
+    w.state.height = w.state.width = 128
+    try:
+        w._make_init_latents(2)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for an init_noise of the wrong latent size")
+    # --init_noise FILE reaches the worker kwargs; a LoRA's or an engine's tensor does too.
+    from safetensors.torch import save_file
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "noise.safetensors"
+        save_file({"init_noise": given}, str(f))
+        assert torch.equal(lean_worker_kwargs(_parse(["--lean", "--init_noise", str(f)]))["init_noise"], given)
+        empty = Path(d) / "empty.safetensors"
+        save_file({"other": given}, str(empty))
+        try:
+            lean_worker_kwargs(_parse(["--lean", "--init_noise", str(empty)]))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for a file without init_noise")
+    a = _parse(["--lean"])
+    assert lean_worker_kwargs(a)["init_noise"] is None
+    a.init_noise_tensor = given                  # what apply_onestep_lora / apply_trt_engine set
+    assert lean_worker_kwargs(a)["init_noise"] is given
+    print("[OK] init_noise: replaces the draw, checked against the resolution, reaches the worker from the CLI")
 
 
 def _te_ticks(w, n, cached_after_first=True):
@@ -291,6 +332,7 @@ if __name__ == "__main__":
     test_default_noise_changes_per_batch()
     test_fixed_noise_is_per_slot()
     test_shared_noise_is_one_pattern()
+    test_init_noise_tensor()
     test_te_refresh_schedule()
     test_cond_refresh_schedule()
     test_reset_sequence()

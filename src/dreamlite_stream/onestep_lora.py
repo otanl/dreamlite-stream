@@ -14,13 +14,16 @@ no adapter module left in the forward pass, so the merged UNet costs exactly
 what the base UNet costs, and torch.compile or an ONNX export see an
 ordinary UNet. `MergedLoRA.restore()` puts the original weights back.
 
-A LoRA is trained for one resolution and one noise seed (the noise tensor it
-was fitted to) and for the prompts in its metadata; `compatibility_notes`
-reports mismatches against how a worker is about to be run.
+A LoRA is trained for one resolution, one init-noise tensor and the prompts
+in its metadata; `compatibility_notes` reports mismatches against how a
+worker is about to be run. The noise tensor is stored in the file
+(`init_noise`) and used as the worker's shared noise, because a seed alone
+does not pin it down: seeded draws differ between torch builds.
 
 File format: safetensors with `<module path>.lora_A` (rank, in) and
-`<module path>.lora_B` (out, rank) per adapted layer, and string metadata
-(JSON-encoded values) describing how it was trained.
+`<module path>.lora_B` (out, rank) per adapted layer, `init_noise`
+(1, C, h, w), and string metadata (JSON-encoded values) describing how it
+was trained.
 """
 
 from __future__ import annotations
@@ -38,6 +41,8 @@ import torch.nn.functional as F
 #   attn  attention projections (to_q / to_k / to_v / to_out.0), 25% of the UNet
 #   ff    transformer feed-forward Linears, 51% of the UNet
 #   pw    pointwise (1x1) convolutions of the ResNet blocks, 11% of the UNet
+NOISE_KEY = "init_noise"   # the shared init-noise tensor a LoRA was fitted to
+
 TARGET_PATTERNS = {
     "attn": re.compile(r"\.attn[12]\.to_(q|k|v)$|\.attn[12]\.to_out\.0$"),
     "ff": re.compile(r"\.ff\.net\.(0\.proj|2)$"),
@@ -144,6 +149,20 @@ def load(path) -> Tuple[Dict[str, torch.Tensor], dict]:
     return state, meta
 
 
+def init_noise(state: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+    """The init-noise tensor stored with a LoRA, or None for a file written before it was stored."""
+    return state.get(NOISE_KEY)
+
+
+def load_init_noise(path) -> torch.Tensor:
+    """Read just the `init_noise` tensor of a safetensors file (a LoRA, or an engine's .noise file)."""
+    from safetensors import safe_open
+    with safe_open(str(path), framework="pt") as f:
+        if NOISE_KEY not in f.keys():
+            raise ValueError(f"{path} holds no '{NOISE_KEY}' tensor")
+        return f.get_tensor(NOISE_KEY)
+
+
 def layer_names(state: Dict[str, torch.Tensor]) -> List[str]:
     return sorted(k[: -len(".lora_A")] for k in state if k.endswith(".lora_A"))
 
@@ -206,13 +225,21 @@ def merge(unet: nn.Module, state: Dict[str, torch.Tensor], meta: Optional[dict] 
 
 
 def compatibility_notes(meta: dict, *, size: int, seed: Optional[int], steps: int,
-                        shared_noise: bool, prompt: Optional[str] = None) -> List[str]:
-    """Human-readable mismatches between how a LoRA was trained and how it will be run."""
+                        shared_noise: bool, prompt: Optional[str] = None,
+                        has_noise: bool = False) -> List[str]:
+    """Human-readable mismatches between how a LoRA was trained and how it will be run.
+
+    `has_noise`: the file carries its init-noise tensor and the worker will
+    use it, so the seed no longer matters.
+    """
     notes: List[str] = []
     if meta.get("size") not in (None, size):
         notes.append(f"trained at {meta['size']}x{meta['size']}, running at {size}x{size}")
-    if meta.get("seed") is not None and seed != meta["seed"]:
-        notes.append(f"trained for noise seed {meta['seed']}, running with seed {seed}")
+    if not has_noise and meta.get("seed") is not None:
+        if seed != meta["seed"]:
+            notes.append(f"trained for noise seed {meta['seed']}, running with seed {seed}")
+        notes.append("the file stores no init-noise tensor; it fits only where this torch build draws, for "
+                     "that seed, the tensor it was trained on (seeded draws differ between builds)")
     if not shared_noise:
         notes.append("trained for one shared init-noise tensor; pass --shared_noise (or --lean)")
     if steps != 1:

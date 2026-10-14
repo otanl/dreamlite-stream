@@ -216,23 +216,38 @@ def test_save_load_roundtrip():
     w = ol.attach(u, rank=2, targets=("attn", "pw"))
     _randomise(w)
     state = ol.state_from_wrappers(w)
+    n_layers = len(ol.layer_names(state))
+    assert ol.init_noise(state) is None
+    noise = torch.randn(1, 4, 8, 8)
+    state[ol.NOISE_KEY] = noise
     meta = dict(size=768, seed=42, rank=2, alpha=2.0, targets=["attn", "pw"], prompts=["a", "b c"])
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "x.safetensors"
         ol.save(path, state, meta)
         state2, meta2 = ol.load(path)
+        assert torch.equal(ol.load_init_noise(path), noise)
     assert meta2 == meta
     assert set(state2) == set(state) and all(torch.equal(state[k], state2[k]) for k in state)
-    print("[OK] save / load round-trips tensors and typed metadata")
+    # The stored init noise travels with the file and is not mistaken for a layer.
+    assert torch.equal(ol.init_noise(state2), noise)
+    assert len(ol.layer_names(state2)) == n_layers
+    ol.detach(u, w)
+    assert ol.merge(u, state2, meta2).n_layers == n_layers
+    print("[OK] save / load round-trips tensors, the init noise and typed metadata")
 
 
 def test_compatibility_notes():
     meta = dict(size=768, seed=42, prompts=["p1"])
-    ok = ol.compatibility_notes(meta, size=768, seed=42, steps=1, shared_noise=True, prompt="p1")
-    assert ok == []
-    bad = ol.compatibility_notes(meta, size=640, seed=7, steps=2, shared_noise=False, prompt="other")
-    assert len(bad) == 5
-    print("[OK] compatibility_notes: silent when matched, one note per mismatch")
+    run = dict(size=768, steps=1, shared_noise=True, prompt="p1")
+    # A file that carries its init noise: matched is silent, and the seed is irrelevant.
+    assert ol.compatibility_notes(meta, seed=42, has_noise=True, **run) == []
+    assert ol.compatibility_notes(meta, seed=7, has_noise=True, **run) == []
+    # A file without it depends on the seed reproducing the tensor, and says so.
+    assert len(ol.compatibility_notes(meta, seed=42, **run)) == 1
+    assert len(ol.compatibility_notes(meta, seed=7, **run)) == 2
+    bad = ol.compatibility_notes(meta, size=640, seed=7, steps=2, shared_noise=False, prompt="other", has_noise=True)
+    assert len(bad) == 4
+    print("[OK] compatibility_notes: silent when matched, one note per mismatch, seed ignored with stored noise")
 
 
 if __name__ == "__main__":
