@@ -16,7 +16,8 @@ The repo does not run standalone. It expects sibling checkouts next to it:
 
 - `../dreamlite` — upstream ByteVisionLab/DreamLite. Provides `dreamlite.DreamLiteMobilePipeline`; weights at `../dreamlite/models/DreamLite-mobile`.
 - `../dreamlite-lllite` — provides `dreamlite_lllite.apply_lllite` / `LLLiteController` (the compile-friendly LLLite module lives there, not here).
-- `../Practical-RIFE` — optional, only for `demo_camera.py --interp_method rife`.
+
+RIFE interpolation (`demo_camera.py --interp_method rife`) needs only the v4.25 checkpoint at `data/rife/v4.25/flownet.pkl` (gitignored; from the download linked in hzwer/Practical-RIFE). No checkout of that repo is needed; the network is defined in `rife.py`.
 
 Most scripts prepend `src/`, `../dreamlite` and `../dreamlite-lllite/src` to `sys.path` themselves, so they run from the repo root without `pip install -e .`.
 
@@ -24,9 +25,13 @@ Three interpreters on this machine can run the code, and they are not interchang
 
 | Interpreter | Stack | Use for |
 |---|---|---|
-| WSL Ubuntu `~/projects/venv/bin/python` (3.10) | torch 2.12.0+cu126, transformers 4.57, Linux triton 3.7, dreamlite-lllite installed | Where `out/champion/results.jsonl` was produced (its paths are `/mnt/f/...`); the live demo also runs here (WSLg, NDI). WSL's system `python3` cannot run the pipeline (its transformers predates Qwen3-VL) |
+| WSL Ubuntu `~/projects/venv/bin/python` (3.10) | torch 2.12.0+cu126, transformers 4.57, Linux triton 3.7, dreamlite-lllite installed, TensorRT 10.16.1 and onnx (added 2026-10-14) | Where `out/champion/results.jsonl` was produced (its paths are `/mnt/f/...`); the live demo also runs here (WSLg, NDI). WSL's system `python3` cannot run the pipeline (its transformers predates Qwen3-VL) |
 | Windows bare `python` = `C:\Python314` | torch 2.11.0+cu128, transformers 5.2, diffusers 0.39 dev, triton-windows 3.7, sageattention, gemlite, hqq; no TensorRT | Current Windows work; the notes call this the main env |
-| `F:/work/dreamlite/.venv/Scripts/python.exe` (3.10) | torch 2.6.0+cu124, transformers 4.57, TensorRT 10.16, onnxruntime-gpu | Anything TensorRT / ONNX |
+| `F:/work/dreamlite/.venv/Scripts/python.exe` (3.10) | torch 2.6.0+cu124, transformers 4.57, TensorRT 10.16, onnxruntime-gpu, opencv headless (no window) | Anything TensorRT / ONNX: `build_trt_*.py`, `--trt_engine`, `--rife_engine` |
+
+A TensorRT engine only loads in the TensorRT version that built it, on the platform that built it. Engines under `out/trt/` belong to the Windows TensorRT venv and those under `out/trt_wsl/` to WSL; the spec file records both and a mismatch is refused. `C:\Python314` can only take TensorRT 11.1 or later (first release with cp314 wheels; strongly typed networks only, which is what the build scripts produce).
+
+The interpreters differ in transformers version, and that changes what the text encoder returns: DreamLite conditions on Qwen3-VL's `hidden_states[-1]`, which in transformers 4.57.3 (the version upstream pins) is the last decoder layer's output *before* the language model's final norm, and in transformers 5 is the tensor *after* it. After the UNet's prompt projection the two differ by about 70%, and the pictures differ accordingly (4-step outputs of the two interpreters at 768: LPIPS 0.136). `pipeline_ops.prompt_hidden_state` reads the pre-norm tensor on either version and the in-repo encode paths use it, so the interpreters now agree (embeddings to about 2%; 4-step outputs at 640 to LPIPS 0.012, against 0.150 before). Not covered: upstream's own `pipeline.__call__` / `encode_prompt`, and the scripts that call the encoder themselves (`champion_eval_token_pruning.py`, `measure_te_batch_scaling.py`, `test_idpruner_qwen3vl.py`, `test_vit_compile_qwen3vl.py`); run those with 4.57.3.
 
 The first `import torch` under `C:\Python314` can take over a minute; allow for it in command timeouts.
 
@@ -45,16 +50,33 @@ $PY scripts/champion_eval.py --sequences blackswan --max_frames 64   # one clip
 $PY scripts/infer_temporal_lllite.py --input assets/davis_mp4/blackswan.mp4 \
     --output out/demo.mp4 --prompt "transfer this to oil painting style, vibrant colors"
 
-# Live webcam / NDI demo
-$PY scripts/demo_camera.py --prompt "..." --cond_refresh_every 4 --te_refresh_every 16 \
-    --te_batch_one --fixed_noise --compile_mode reduce-overhead
+# Live webcam / NDI demo (lean path at 640x640)
+$PY scripts/demo_camera.py --prompt "..." --lean --size 640 --compile_mode reduce-overhead
+# ... at 768 with the TensorRT UNet (one-step LoRA inside) and RIFE x2 on the display side
+$PY scripts/demo_camera.py --prompt "..." --lean --size 768 --trt_engine out/trt/unet_768_b8_lora.engine \n    --interp_factor 2 --interp_method rife --rife_engine out/trt/rife_768_b8.engine
+
+# Loop throughput and latency; --lean and --size select the operating point
+$PY scripts/sustained_throughput_test.py --batch_size 8 --lean --size 640 --out_json out/sustained_lean_640.json
 
 # Training: pairs -> adapter (v3 recipe is recorded in runs/temporal_lllite_v3/args.json)
 $PY scripts/generate_temporal_pairs.py ...   # writes data/temporal_pairs_*/
 $PY scripts/train_temporal_lllite.py --pairs_dir data/... --out_dir runs/...
+
+# One-step LoRA for the lean path (one per resolution) -> runs/onestep_lora_<size>/
+$PY scripts/train_onestep_lora.py --size 768
+$PY scripts/train_onestep_lora.py --size 768 --eval_only      # re-score an existing one
+$PY scripts/champion_eval.py --lean --size 768 --lllite_multiplier 0 \
+    --onestep_lora runs/onestep_lora_768/onestep_lora.safetensors
+
+# TensorRT (interpreter with tensorrt): UNet engine with the LoRA merged in, RIFE engine
+$PY scripts/build_trt_unet.py --size 768 --batch_size 8 --lllite_multiplier 0 \
+    --onestep_lora runs/onestep_lora_768/onestep_lora.safetensors   # -> out/trt/unet_768_b8_lora.engine
+$PY scripts/build_trt_rife.py --size 768 --batch_size 8             # -> out/trt/rife_768_b8.engine
+$PY scripts/sustained_throughput_test.py --lean --size 768 --batch_size 8 \
+    --trt_engine out/trt/unet_768_b8_lora.engine
 ```
 
-Tests are standalone scripts with a `__main__` block, not pytest. `scripts/test_idpruner_algorithm.py` is the only one that runs on CPU without weights; the other `scripts/test_*.py` load the model on CUDA, and the `test_trt_*` ones also need a built TensorRT engine.
+Tests are standalone scripts with a `__main__` block, not pytest. `scripts/test_idpruner_algorithm.py`, `scripts/test_lean_options.py`, `scripts/test_onestep_lora.py` and `scripts/test_rife_interp.py` run on CPU without weights; the other `scripts/test_*.py` load the model on CUDA, and the `test_trt_*` ones also need an engine from the older TensorRT attempt.
 
 ```bash
 $PY scripts/test_idpruner_algorithm.py
@@ -86,6 +108,39 @@ DreamLite's edit mode is a diptych: the noise latent and the reference-frame lat
 - **Demo-only split.** `prefetch_cpu_only` runs on a background thread and does the TE forward on a separate `_te_side_stream`, so the `.item()` sync inside Qwen3-VL blocks that thread rather than the pipeline thread. `prefetch_gpu_kick` then runs on the pipeline thread. Cross-stream reads of the TE cache are ordered by `_last_cache_te_ev`.
 - **Amortisation knobs.** `cond_refresh_every` (reuse the LLLite cond embedding for N batches), `te_refresh_every` (reuse TE embeddings), `te_batch_one` (encode one frame and broadcast).
 
+### Lean path
+
+`dreamlite_stream/lean.py` defines an opt-in operating point that leaves only the UNet and the VAE in the per-batch path, and the CLI plumbing for it (`--lean` on `champion_eval.py`, `sustained_throughput_test.py`, `demo_camera.py`). It maps to worker fields that also work one at a time:
+
+- `te_refresh_every=0` (+ `te_batch_one`): prompt embedding encoded once, reused until `reset_sequence()` or a forced refresh.
+- `cond_refresh_every=0`: LLLite cond set on the first batch and held; no flow, no cond CNN, no previous-frame tracking.
+- `shared_noise`: one `(1, C, h, w)` draw expanded to every frame of every batch.
+- `fast_vae` (+ `vae_compile`): a private fp16 / channels_last deep copy of the VAE with normalisation and uint8 quantisation on the GPU. `pipeline.vae` is not modified, so other workers sharing the pipeline are unaffected. Frames may be PIL images or uint8 arrays; `output_type="np"` returns arrays.
+
+The default path is unchanged and is what the paper tables use. Lean is a different operating point (the prompt embedding no longer sees every frame), not a faster route to the same numbers. A worker reused across unrelated clips must call `reset_sequence()` when any of this state is held; `lean.holds_clip_state(args)` says when. `scripts/test_lean_options.py` covers the option logic on CPU.
+
+### One-step LoRA
+
+On the lean path the K-step output is a deterministic function of the input frame (shared noise, prompt embedding fixed per clip), so K steps can be distilled into one by paired regression. `scripts/train_onestep_lora.py` does that (Huber on the latent + LPIPS on decoded crops, EMA, teacher targets cached under `data/onestep_targets_<size>/`); `onestep_lora.py` holds the training wrappers and `merge`, which adds the deltas to the UNet weights in place. `lean.apply_onestep_lora` merges before the worker compiles, so the run-time graph is an ordinary UNet.
+
+- A LoRA is tied to its resolution and to one init-noise tensor, which is stored in the file (`init_noise`) and handed to the worker as `init_noise` (`lean_worker_kwargs`); a TensorRT engine keeps a copy next to it (`.noise.safetensors`). The seed is not enough: a seeded bf16 `torch.randn` on the CPU gives one tensor under torch 2.6 / 2.11 on Windows and an unrelated one under torch 2.12 in WSL, while a float32 draw is the same everywhere. `shared_noise` therefore draws in float32 (`make_init_noise(draw_dtype=...)`); the default path keeps its per-batch bf16 draw, so its pictures still depend on the torch build. `--init_noise FILE` runs anything on a stored tensor, which is how a base-model reference for a LoRA has to be made. `compatibility_notes` reports mismatches at load. It is trained on style prompts: on prompts that restructure the scene it stays close to the source frame, so the edit comes out weaker than with more steps.
+- Evaluate against the *base* UNet's K-step output. Anything that builds a reference must run before wrappers are attached or after they are detached; `final_eval` in the training script is ordered that way.
+- With a LoRA merged the LLLite adapter adds little (DAVIS-10 warp error with / without: 16.12 / 16.19 at 768, 14.86 / 15.31 at 640) and moves the output away from the 4-step reference; run LoRA configs with `--lllite_multiplier 0`. Multiplier 0 skips `apply_lllite` altogether in the three entry scripts (`controller` is `None`).
+- Rounding the merged weights into bf16 leaves about a quarter of the delta's norm as rounding error per element, but the output is unaffected (LPIPS to the reference identical to three decimals before and after the merge).
+
+### TensorRT backend
+
+`scripts/build_trt_unet.py` exports the UNet to an fp16 ONNX graph and builds a strongly typed engine; `trt_engine.py::TRTEngineUNet` stands in for `pipeline.unet` (`lean.apply_trt_engine`, flag `--trt_engine`). The worker skips `torch.compile` for it (`is_trt_engine`).
+
+- The prompt projection `encoder_hid_proj` (Linear + RMSNorm) stays outside the engine and runs in PyTorch fp32. Raw Qwen3-VL embeddings reach about 1100 in magnitude and the RMSNorm squares them, which overflows fp16; this is what broke the earlier TensorRT attempt (`trt_unet.py`, `trt_unet_lllite.py`, kept for the paper's negative result).
+- The one-step LoRA is merged before export. The adapter, if built in, has its per-hook cond embeddings as engine inputs read from the controller's `_cond_emb_buf`; its multiplier is a constant of the engine.
+- An engine is fixed to one size, one batch size and one TensorRT version. `<engine>.json` (`EngineSpec`) records what it was built from; `apply_trt_engine` refuses a mismatching run, and with no explicit `--lllite_multiplier` the spec supplies it.
+- Stage 1 (export) also writes `<name>.check.safetensors` with real inputs and the fp32 PyTorch output; stage 2 (build) needs only tensorrt and those files, so the two stages can run under different interpreters.
+
+### RIFE interpolation
+
+`rife.py` holds the RIFE v4.25 network (inference path, parameter names matching the Practical-RIFE checkpoint) and `RIFEInterpolator`, which turns a batch of N output frames into N * factor display frames in one network call. Each frame is encoded once, the last frame is carried so the pair across a batch boundary is interpolated too, and warp coordinates stay fp32 while the convolutions run fp16. Backends: PyTorch, or an engine from `scripts/build_trt_rife.py` (`--rife_engine`). It runs on the demo's display thread.
+
 ### Temporal LLLite
 
 `apply_lllite(pipeline.unet, inference_mode=True, max_batch_size=B, block_filter=[...])` patches attention Linear layers and must be called before `torch.compile` so the hooks are inside the compiled graph. The cond image passed to `controller.set_cond_image` is the previous batch's last *decoded output*, warped by optical flow computed on the *input* frames (`flow.py`); the first batch uses the input frames themselves. `metrics.py` and `output_blend.py` use the same flow-on-input convention, so the headline `warp_err` metric and the conditioning agree on what counts as motion.
@@ -110,7 +165,7 @@ The UNet is compiled with `mode="reduce-overhead", dynamic=False`, i.e. captured
 
 ### Modules outside the main path
 
-`trt_unet.py` / `trt_unet_lllite.py` (TensorRT, reported as a negative result), `te_pruning.py` (IDPruner; `HAWKHook` is a placeholder), `sage_attn.py`, `te_vit_compile.py`, and `distillation_losses.py` (LCM-LoRA loss presets B3/O1/O2/O3 for follow-up work) are scaffolding or side studies. `frame_interp.py` is display-side only and does not affect pipeline throughput.
+`trt_unet.py` / `trt_unet_lllite.py` (the first TensorRT attempt, reported as a negative result; superseded by `trt_engine.py`), `te_pruning.py` (IDPruner; `HAWKHook` is a placeholder), `sage_attn.py`, `te_vit_compile.py`, and `distillation_losses.py` (LCM-LoRA loss presets B3/O1/O2/O3 for follow-up work) are scaffolding or side studies. `frame_interp.py` (linear blends, temporal blend) and `rife.py` are display-side only.
 
 ## Layout conventions
 
