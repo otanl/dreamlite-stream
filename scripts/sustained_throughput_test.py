@@ -16,6 +16,10 @@ reported:
                    `throughput_fps` / `batch_wall_ms`); it leaves out the time
                    the thread spends inside `prefetch_batch`.
 
+Pass --lean (or the individual flags it stands for; see
+dreamlite_stream/lean.py) to measure the reduced per-batch path, and --size
+to change the resolution. The defaults reproduce the paper's configuration.
+
 Reports:
   - loop fps and step-only fps
   - per-iteration wall: p50, p95, max, and the prefetch / step halves
@@ -57,6 +61,9 @@ from dreamlite_lllite.inject import apply_lllite  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
 
 from dreamlite_stream import BatchedEditWorker, SharedState  # noqa: E402
+from dreamlite_stream.lean import (  # noqa: E402
+    add_lean_args, apply_onestep_lora, apply_trt_engine, lean_worker_kwargs, resolve_lean_args,
+)
 
 
 def parse_args():
@@ -67,14 +74,18 @@ def parse_args():
     p.add_argument("--prompt", default="transfer this to oil painting style, vibrant colors")
     p.add_argument("--total_frames", type=int, default=480)
     p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--cond_refresh_every", type=int, default=8)
+    p.add_argument("--cond_refresh_every", type=int, default=None,
+                   help="Refresh the LLLite cond every N batches. 0 = set it "
+                        "once and hold. Default 8, or 0 with --lean.")
     p.add_argument("--size", type=int, default=512)
     p.add_argument("--steps", type=int, default=1)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--warmup_batches", type=int, default=4)
     p.add_argument("--source_fps", type=float, default=30.0, help="virtual source fps for latency calculation")
     p.add_argument("--out_json", default=str(_ROOT / "out" / "sustained_throughput.json"))
-    return p.parse_args()
+    add_lean_args(p)
+    return resolve_lean_args(p.parse_args())
 
 
 def percentile(xs, q):
@@ -105,21 +116,28 @@ def main():
     pipeline = DreamLiteMobilePipeline.from_pretrained(
         args.model, torch_dtype=torch.bfloat16,
     ).to(args.device)
+    apply_onestep_lora(pipeline, args)
 
     print(f"[lllite] {args.lllite_weights}")
     sd = load_file(args.lllite_weights)
     vae_downsample = 2 ** (len(pipeline.vae.config.encoder_block_out_channels) - 1)
     latent_hw = args.size // vae_downsample
-    controller = apply_lllite(
-        pipeline.unet, cond_emb_dim=32, mlp_dim=64,
-        cond_image_size=args.size, sample_size=latent_hw,
-        block_filter=["down_blocks"], inference_mode=True,
-        max_batch_size=args.batch_size,
-    )
-    controller.load_state_dict(sd, strict=False)
-    controller.to(device=args.device, dtype=torch.bfloat16)
-    controller.eval()
-    controller.set_multiplier(1.0)
+    if args.lllite_multiplier != 0:
+        controller = apply_lllite(
+            pipeline.unet, cond_emb_dim=32, mlp_dim=64,
+            cond_image_size=args.size, sample_size=latent_hw,
+            block_filter=["down_blocks"], inference_mode=True,
+            max_batch_size=args.batch_size,
+        )
+        controller.load_state_dict(sd, strict=False)
+        controller.to(device=args.device, dtype=torch.bfloat16)
+        controller.eval()
+        controller.set_multiplier(args.lllite_multiplier)
+    else:
+        # Multiplier 0 means no adapter: attach nothing, rather than hooks that add zero.
+        controller = None
+        print("[lllite] off (--lllite_multiplier 0): adapter not attached")
+    apply_trt_engine(pipeline, args, controller)
 
     # Load and loop frames
     import cv2
@@ -131,7 +149,9 @@ def main():
             break
         f_rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
         f_rgb = cv2.resize(f_rgb, (args.size, args.size), interpolation=cv2.INTER_AREA)
-        raw.append(Image.fromarray(f_rgb))
+        # The fast VAE path takes uint8 arrays directly, as a capture source
+        # would deliver them; the default path takes PIL images.
+        raw.append(f_rgb if args.fast_vae else Image.fromarray(f_rgb))
     cap.release()
     if not raw:
         raise RuntimeError(f"empty mp4 {args.mp4}")
@@ -144,10 +164,18 @@ def main():
     )
     worker = BatchedEditWorker(
         pipeline=pipeline, state=state, batch_size=args.batch_size,
-        device=args.device, dtype=torch.bfloat16, seed=42,
+        device=args.device, dtype=torch.bfloat16, seed=args.seed,
         compile=True, compile_mode="reduce-overhead",
         lllite_controller=controller,
-        cond_refresh_every=args.cond_refresh_every,
+        **lean_worker_kwargs(args),
+    )
+    print(
+        f"[config] size={args.size} B={args.batch_size} K={args.steps}  "
+        f"te_refresh_every={args.te_refresh_every} te_batch_one={args.te_batch_one}  "
+        f"cond_refresh_every={args.cond_refresh_every}  shared_noise={args.shared_noise}  "
+        f"fast_vae={args.fast_vae} vae_compile={args.vae_compile}  "
+        f"onestep_lora={'yes' if args.onestep_lora else 'no'} lllite_multiplier={args.lllite_multiplier}  "
+        f"trt_engine={'yes' if args.trt_engine else 'no'}"
     )
 
     print(f"[run] {len(frames) // args.batch_size} batches, B={args.batch_size}, warmup={args.warmup_batches}")
@@ -219,6 +247,11 @@ def main():
             "batch_size": B, "steps": args.steps, "size": args.size,
             "total_frames": args.total_frames, "warmup_batches": args.warmup_batches,
             "cond_refresh_every": args.cond_refresh_every,
+            "te_refresh_every": args.te_refresh_every, "te_batch_one": args.te_batch_one,
+            "shared_noise": args.shared_noise,
+            "fast_vae": args.fast_vae, "vae_compile": args.vae_compile,
+            "onestep_lora": args.onestep_lora, "lllite_multiplier": args.lllite_multiplier,
+            "trt_engine": args.trt_engine,
             "cache_size_limit": torch._dynamo.config.cache_size_limit,
             "source_fps": args.source_fps,
         },

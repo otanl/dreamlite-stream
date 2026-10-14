@@ -56,6 +56,17 @@ class VideoWriter:
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         self._w.write(bgr)
 
+    def write_rgb(self, rgb: np.ndarray) -> None:
+        """Write a uint8 (H, W, 3) RGB array."""
+        self._w.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+    def write(self, frame) -> None:
+        """Write a frame given as a PIL image or a uint8 RGB array."""
+        if isinstance(frame, np.ndarray):
+            self.write_rgb(frame)
+        else:
+            self.write_pil(frame)
+
     def close(self) -> None:
         self._w.release()
 

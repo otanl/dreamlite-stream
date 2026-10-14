@@ -6,6 +6,11 @@ Champion config (from v3 sweep):
     LLLite v3 with --lllite_blocks down_blocks  (38 hooks)
     --cond_refresh_every 8
 
+Pass --lean (or the individual flags it stands for) to run the reduced
+per-batch path instead: prompt embedding and LLLite cond computed once per
+clip, one shared init-noise draw, and the fp16 compiled VAE with uint8 I/O.
+See dreamlite_stream/lean.py. The defaults reproduce the paper's numbers.
+
 Reports per-sequence:
     fps        step-only: frames / time inside step_batch_with_prefetch
     fps_loop   prefetch + step: also counts the time this thread spends in
@@ -24,6 +29,7 @@ import warnings
 from pathlib import Path
 from statistics import mean, stdev
 
+import numpy as np
 import torch
 import torch._dynamo
 
@@ -43,6 +49,10 @@ from dreamlite_lllite import apply_lllite  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
 
 from dreamlite_stream import BatchedEditWorker, SharedState  # noqa: E402
+from dreamlite_stream.lean import (  # noqa: E402
+    add_lean_args, apply_onestep_lora, apply_trt_engine, holds_clip_state, lean_worker_kwargs,
+    resolve_lean_args,
+)
 from dreamlite_stream.metrics import compute_temporal, read_video_frames, reference_l1  # noqa: E402
 from dreamlite_stream.runtime import VideoWriter, iter_video_frames  # noqa: E402
 
@@ -60,7 +70,9 @@ def parse_args():
     ])
     p.add_argument("--size", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--cond_refresh_every", type=int, default=8)
+    p.add_argument("--cond_refresh_every", type=int, default=None,
+                   help="Refresh the LLLite cond every N batches. 0 = set it "
+                        "once per clip and hold. Default 8, or 0 with --lean.")
     p.add_argument("--lllite_blocks", default="down_blocks")
     p.add_argument("--steps", type=int, default=1)
     p.add_argument("--device", default="cuda")
@@ -68,7 +80,8 @@ def parse_args():
     p.add_argument("--max_frames", type=int, default=64)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--out_dir", default=str(_ROOT / "out" / "champion"))
-    return p.parse_args()
+    add_lean_args(p)
+    return resolve_lean_args(p.parse_args())
 
 
 @torch.no_grad()
@@ -99,7 +112,9 @@ def run_sequence(worker, args, seq_name: str, out_dir: Path):
             if idx >= args.max_frames:
                 return buf, False
             fps_global = fps
-            buf.append(frame)
+            # The fast VAE path takes uint8 arrays directly; hand it those
+            # rather than a PIL image it would only convert back.
+            buf.append(np.asarray(frame) if args.fast_vae else frame)
             n_total += 1
             if len(buf) >= args.batch_size:
                 return buf, True
@@ -124,7 +139,7 @@ def run_sequence(worker, args, seq_name: str, out_dir: Path):
             if writer is None:
                 writer = VideoWriter(str(out_path), args.size, fps_global)
             for img in outputs:
-                writer.write_pil(img)
+                writer.write(img)
             if batch_idx >= args.warmup:
                 timings.append(t)
             batch_idx += 1
@@ -161,23 +176,30 @@ def main():
     pipeline = DreamLiteMobilePipeline.from_pretrained(
         args.model, torch_dtype=torch.bfloat16,
     ).to(args.device)
+    apply_onestep_lora(pipeline, args)
 
     vae_downsample = 2 ** (len(pipeline.vae.config.encoder_block_out_channels) - 1)
     latent_hw = args.size // vae_downsample
     block_filter = [s.strip() for s in args.lllite_blocks.split(",")] if args.lllite_blocks else None
-    controller = apply_lllite(
-        pipeline.unet, cond_emb_dim=32, mlp_dim=64,
-        cond_image_size=args.size, sample_size=latent_hw,
-        inference_mode=True, max_batch_size=args.batch_size,
-        block_filter=block_filter,
-    )
-    sd = load_file(args.lllite_weights)
-    controller.load_state_dict(sd, strict=False)
-    n_attached = len(controller.modules_dict)
-    print(f"[lllite] {n_attached} hooks (blocks={args.lllite_blocks})")
-    controller.to(device=args.device, dtype=torch.bfloat16)
-    controller.eval()
-    controller.set_multiplier(1.0)
+    if args.lllite_multiplier != 0:
+        controller = apply_lllite(
+            pipeline.unet, cond_emb_dim=32, mlp_dim=64,
+            cond_image_size=args.size, sample_size=latent_hw,
+            inference_mode=True, max_batch_size=args.batch_size,
+            block_filter=block_filter,
+        )
+        sd = load_file(args.lllite_weights)
+        controller.load_state_dict(sd, strict=False)
+        n_attached = len(controller.modules_dict)
+        print(f"[lllite] {n_attached} hooks (blocks={args.lllite_blocks})")
+        controller.to(device=args.device, dtype=torch.bfloat16)
+        controller.eval()
+        controller.set_multiplier(args.lllite_multiplier)
+    else:
+        # Multiplier 0 means no adapter: attach nothing, rather than hooks that add zero.
+        controller = None
+        print("[lllite] off (--lllite_multiplier 0): adapter not attached")
+    apply_trt_engine(pipeline, args, controller)
 
     # Create ONE worker reused across all sequences to prevent per-sequence
     # VRAM accumulation that otherwise drives a 24-GB GPU to paging by
@@ -194,7 +216,15 @@ def main():
         device=args.device, dtype=torch.bfloat16, seed=args.seed,
         compile=True, compile_mode="reduce-overhead",
         lllite_controller=controller,
-        cond_refresh_every=args.cond_refresh_every,
+        **lean_worker_kwargs(args),
+    )
+    print(
+        f"[config] size={args.size} B={args.batch_size} K={args.steps}  "
+        f"te_refresh_every={args.te_refresh_every} te_batch_one={args.te_batch_one}  "
+        f"cond_refresh_every={args.cond_refresh_every}  shared_noise={args.shared_noise}  "
+        f"fast_vae={args.fast_vae} vae_compile={args.vae_compile}  "
+        f"onestep_lora={'yes' if args.onestep_lora else 'no'} lllite_multiplier={args.lllite_multiplier}  "
+        f"trt_engine={'yes' if args.trt_engine else 'no'}"
     )
 
     rows = []
@@ -205,10 +235,17 @@ def main():
         result = run_sequence(worker, args, seq, out_dir)
         # Reset per-sequence state on the reused worker (don't drag prefetch
         # buffers / LLLite cond state across sequences).
-        worker.state.frame_idx = 0
-        if hasattr(worker, "_last_prev_decoded"):
-            worker._last_prev_decoded = None
-            worker._last_prev_input_gray = None
+        if holds_clip_state(args):
+            # A cached prompt embedding or a held cond belongs to the clip
+            # it was computed from; clear all of it.
+            worker.reset_sequence()
+        else:
+            # Default path, kept exactly as the paper runs used it: the cond
+            # refresh counter deliberately carries over between sequences.
+            worker.state.frame_idx = 0
+            if hasattr(worker, "_last_prev_decoded"):
+                worker._last_prev_decoded = None
+                worker._last_prev_input_gray = None
         gc.collect()
         torch.cuda.empty_cache()
         if result is None:

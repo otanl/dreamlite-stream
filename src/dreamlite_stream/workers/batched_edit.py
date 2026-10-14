@@ -10,10 +10,21 @@ Trade-off: +(N-1) frames of latency. At 22 FPS with N=4, that's ~135 ms
 buffering delay before the first output of each batch is emitted. For
 non-interactive video editing this is acceptable.
 
-LLLite support is intentionally omitted in this first version: the cond_emb
-buffer machinery would have to grow to (max_B, seq, dim), and the spec
-mechanism doesn't compose cleanly with batched dispatch. The pure-base
-batched worker is sufficient to demonstrate the speedup hypothesis.
+An LLLite controller is optional (`lllite_controller`); its cond_emb buffers
+must be sized for this worker's batch (`max_batch_size == batch_size`).
+
+Opt-in options that trade per-frame recomputation for throughput, none of
+which change the default path:
+
+  te_refresh_every=0   encode the prompt + image once and reuse it
+  cond_refresh_every=0 set the LLLite cond once and hold it
+  shared_noise         one init-noise draw for every frame of every batch
+  fast_vae             fp16 / channels_last VAE with GPU-side
+                       (de)normalisation instead of the PIL image_processor
+  vae_compile          torch.compile that VAE
+  output_type="np"     return uint8 arrays instead of PIL images
+
+`reset_sequence()` clears the per-clip state those options hold.
 """
 
 from __future__ import annotations
@@ -102,10 +113,19 @@ class BatchedEditWorker:
     # for every frame so per-frame latent variation comes only from input
     # changes. Reduces flicker without adding compute.
     fixed_noise: bool = False
+    # One init-noise draw shared by EVERY frame of every batch (a single
+    # (1, C, h, w) tensor expanded to B). fixed_noise above only repeats the
+    # same (B, C, h, w) tensor batch after batch, so each batch slot keeps
+    # its own pattern and neighbouring frames still get different noise;
+    # shared_noise removes that difference too. On a static input the
+    # output is then identical from frame to frame.
+    shared_noise: bool = False
     # Refresh the LLLite cond_emb buffer only every N batches; reuse the
     # previous embedding in between. Hides the 108-hook CNN cost when N>1
     # without retraining (the previous cond is a good approximation when
-    # consecutive batches see similar scenes).
+    # consecutive batches see similar scenes). 0 = set it on the first
+    # batch after construction / reset_sequence() and hold it from then on
+    # (no optical flow, no cond CNN, no previous-frame tracking).
     cond_refresh_every: int = 1
 
     # Refresh the Q3-VL TE prompt_embeds only every N batches; reuse them
@@ -113,7 +133,9 @@ class BatchedEditWorker:
     # stream (~250 ms TE forward at B=8 on a 3090Ti) when the prompt is
     # static across frames. The image-conditioned part of the TE drifts
     # slowly under fixed prompts so a refresh schedule similar to
-    # cond_refresh_every is safe in practice. 1 = no caching.
+    # cond_refresh_every is safe in practice. 1 = no caching. 0 = encode
+    # once and reuse until reset_sequence() or a forced refresh (prompt
+    # change); the TE then leaves the per-batch path entirely.
     te_refresh_every: int = 1
 
     # On TE refresh, run Q3-VL on a SINGLE representative frame
@@ -131,7 +153,26 @@ class BatchedEditWorker:
     # refresh. Default 8 workers; set 0 to disable threading.
     cond_flow_workers: int = 8
 
+    # Run VAE encode/decode through a private fp16 / channels_last copy of
+    # the VAE, with normalisation and uint8 quantisation done on the GPU,
+    # instead of pipeline.image_processor (PIL -> float on the host going
+    # in, float -> PIL coming out: ~9 ms per 512x512 frame on the calling
+    # thread). pipeline.vae itself is left untouched, so other workers
+    # sharing the pipeline are unaffected. Frames may be PIL images or
+    # uint8 (H, W, 3) arrays either way.
+    fast_vae: bool = False
+    # Additionally torch.compile the private VAE with autotuned kernels and
+    # no CUDA graphs (so it carries no thread affinity). Compiled once at
+    # construction for (batch_size, height, width). Requires fast_vae.
+    vae_compile: bool = False
+    # "pil" returns PIL images. "np" returns uint8 (H, W, 3) RGB arrays,
+    # which saves a PIL round trip when the caller wants arrays anyway.
+    output_type: str = "pil"
+
     _compiled: bool = field(default=False, init=False, repr=False)
+    _vae_enc: Optional[object] = field(default=None, init=False, repr=False)
+    _vae_dec: Optional[object] = field(default=None, init=False, repr=False)
+    _shared_noise_cache: Optional[torch.Tensor] = field(default=None, init=False, repr=False)
     _side_stream: Optional[torch.cuda.Stream] = field(default=None, init=False, repr=False)
     # Dedicated CUDA stream for the background Q3-VL TE forward (driven by
     # the bg cpu_prep_pool thread). Lets the .item() sync inside Q3-VL's
@@ -157,14 +198,67 @@ class BatchedEditWorker:
     _last_cache_te_ev: Optional[torch.cuda.Event] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.output_type not in ("pil", "np"):
+            raise ValueError(f"output_type must be 'pil' or 'np', got {self.output_type!r}")
+        if self.vae_compile and not self.fast_vae:
+            raise ValueError("vae_compile requires fast_vae")
         if isinstance(self.device, str) and self.device.startswith("cuda"):
             self._side_stream = torch.cuda.Stream()
             self._te_side_stream = torch.cuda.Stream()
         if self.compile:
             self._enable_compile()
+        if self.fast_vae:
+            self._enable_fast_vae()
         if self.cond_flow_workers and self.cond_flow_workers > 1:
             from concurrent.futures import ThreadPoolExecutor
             self._cond_flow_pool = ThreadPoolExecutor(max_workers=self.cond_flow_workers)
+
+    def reset_sequence(self) -> None:
+        """Forget everything tied to the clip just processed.
+
+        Call between unrelated clips when one worker is reused. Restarts
+        the frame counter (and with it the per-batch noise seeds), drops
+        the LLLite previous-frame state and restarts its refresh schedule
+        so the next clip sets its own cond, and drops the TE cache so the
+        next prefetch re-encodes. The compiled UNet, the VAE and the shared
+        noise draw are untouched.
+        """
+        self.state.frame_idx = 0
+        self._last_prev_decoded = None
+        self._last_prev_input_gray = None
+        self._cond_call_idx = 0
+        self._te_call_idx = 0
+        self._cached_te_embeds = None
+        self._cached_te_mask = None
+        self._last_cache_te_ev = None
+        self._force_te_refresh = False
+
+    def _te_refresh_due(self) -> bool:
+        """Consume one TE tick; True if this call must recompute the cache.
+
+        Shared by prefetch_batch and prefetch_cpu_only so both follow the
+        same schedule. te_refresh_every=0 never refreshes on schedule: only
+        the first call and a forced refresh do.
+        """
+        due = (
+            self._cached_te_embeds is None
+            or self._force_te_refresh
+            or (self.te_refresh_every > 0 and self._te_call_idx % self.te_refresh_every == 0)
+        )
+        self._te_call_idx += 1
+        self._force_te_refresh = False
+        return due
+
+    def _cond_refresh_due(self) -> bool:
+        """True if the NEXT set_cond_image call rebuilds the LLLite cond.
+
+        Does not advance the counter; _set_lllite_cond_for_batch does.
+        cond_refresh_every=0 rebuilds only on the first call.
+        """
+        return self._cond_call_idx == 0 or (
+            self.cond_refresh_every > 0
+            and self._cond_call_idx % self.cond_refresh_every == 0
+        )
 
     def _maybe_kick_cond_flow(self, frames: List[Image.Image]):
         """If LLLite is active AND refresh is due on the NEXT cond-set call,
@@ -176,24 +270,20 @@ class BatchedEditWorker:
         if self.lllite_controller is None or self._cond_flow_pool is None:
             return None
         # The next set_cond_image call (inside step) will refresh iff
-        # _cond_call_idx==0 or _cond_call_idx % refresh_every == 0. We use the
-        # SAME index here; the increment happens inside set_cond_image.
-        will_refresh = (
-            self._cond_call_idx == 0
-            or self._cond_call_idx % max(1, self.cond_refresh_every) == 0
-        )
-        if not will_refresh:
+        # _cond_refresh_due(). We read the SAME index here; the increment
+        # happens inside _set_lllite_cond_for_batch.
+        if not self._cond_refresh_due():
             return None
         if self._last_prev_decoded is None or self._last_prev_input_gray is None:
             # First batch: trivial cond (input frames themselves).
             def _identity():
-                return [np.asarray(f.convert("RGB")) for f in frames]
+                return [ops.as_rgb_array(f) for f in frames]
             return self._cond_flow_pool.submit(_identity)
         prev_rgb = self._last_prev_decoded
         prev_gray = self._last_prev_input_gray
 
         def _flow_one(f):
-            curr_rgb = np.asarray(f.convert("RGB"))
+            curr_rgb = ops.as_rgb_array(f)
             curr_gray = flowlib.to_gray(curr_rgb)
             flow = flowlib.farneback_flow(prev_gray, curr_gray)
             H, W = flow.shape[:2]
@@ -224,23 +314,20 @@ class BatchedEditWorker:
         """
         if self.lllite_controller is None:
             return
-        if (
-            self._cond_call_idx > 0
-            and self._cond_call_idx % max(1, self.cond_refresh_every) != 0
-        ):
-            self._cond_call_idx += 1
-            return
+        due = self._cond_refresh_due()
         self._cond_call_idx += 1
+        if not due:
+            return
         if precomputed_cond_rgbs is not None:
             cond_rgbs = precomputed_cond_rgbs
         elif self._last_prev_decoded is None or self._last_prev_input_gray is None:
-            cond_rgbs = [np.asarray(f.convert("RGB")) for f in frames]
+            cond_rgbs = [ops.as_rgb_array(f) for f in frames]
         else:
             prev_rgb = self._last_prev_decoded
             prev_gray = self._last_prev_input_gray
 
             def _flow_one(f):
-                curr_rgb = np.asarray(f.convert("RGB"))
+                curr_rgb = ops.as_rgb_array(f)
                 curr_gray = flowlib.to_gray(curr_rgb)
                 flow = flowlib.farneback_flow(prev_gray, curr_gray)
                 H, W = flow.shape[:2]
@@ -265,15 +352,134 @@ class BatchedEditWorker:
         """Save the LAST frame's decoded RGB and input gray for the next batch."""
         if self.lllite_controller is None:
             return
-        last_input = np.asarray(frames[-1].convert("RGB"))
-        last_output = np.asarray(outputs[-1].convert("RGB"))
+        if self.cond_refresh_every == 0:
+            # The cond is held after its first set, so nothing will read these.
+            return
+        last_input = ops.as_rgb_array(frames[-1])
+        last_output = ops.as_rgb_array(outputs[-1])
         self._last_prev_decoded = last_output
         self._last_prev_input_gray = flowlib.to_gray(last_input)
+
+    def _enable_fast_vae(self) -> None:
+        """Build the private fp16 / channels_last VAE, optionally compiled."""
+        import copy
+
+        vae = copy.deepcopy(self.pipeline.vae)
+        vae = vae.to(device=self.device, dtype=torch.float16)
+        vae = vae.to(memory_format=torch.channels_last).eval()
+        self._vae_enc, self._vae_dec = vae.encoder, vae.decoder
+        if not self.vae_compile:
+            return
+        # Autotuning is what makes compiling this VAE worthwhile: for some of
+        # its convs Inductor's Triton kernels beat cuDNN by a wide margin.
+        # It prints a results table per conv; keep that out of the console.
+        sa = None
+        try:
+            import torch._inductor.select_algorithm as sa
+        except Exception:
+            pass
+        prev_print = getattr(sa, "PRINT_AUTOTUNE", None)
+        try:
+            if prev_print is not None:
+                sa.PRINT_AUTOTUNE = False
+            t0 = time.perf_counter()
+            enc = torch.compile(vae.encoder, mode="max-autotune-no-cudagraphs")
+            dec = torch.compile(vae.decoder, mode="max-autotune-no-cudagraphs")
+            s = self.state
+            x = torch.zeros(
+                self.batch_size, 3, s.height, s.width,
+                device=self.device, dtype=torch.float16,
+            ).contiguous(memory_format=torch.channels_last)
+            with torch.no_grad():
+                for _ in range(2):
+                    dec(enc(x))
+            self._vae_enc, self._vae_dec = enc, dec
+            print(
+                f"[compile] vae encoder+decoder compiled for "
+                f"({self.batch_size}, {s.height}, {s.width}) in "
+                f"{time.perf_counter() - t0:.0f}s"
+            )
+        except Exception as e:
+            print(f"[compile] WARN: VAE compile failed ({e}); eager fp16 VAE")
+        finally:
+            if prev_print is not None:
+                sa.PRINT_AUTOTUNE = prev_print
+
+    def _encode_ref_latents(self, frames: List[Image.Image]) -> torch.Tensor:
+        """VAE-encode this batch's frames into reference latents."""
+        s = self.state
+        if self._vae_enc is not None:
+            frames_u8 = ops.frames_to_uint8_batch(frames, s.height, s.width)
+            return ops.encode_uint8_batch_to_latent(
+                self._vae_enc, frames_u8, self.device, torch.float16, self.dtype,
+            )
+        return ops.encode_image_to_latent_batch(
+            self.pipeline, frames, s.height, s.width, self.device, self.dtype,
+        )
+
+    def _encode_prepared(self, vae_input: torch.Tensor) -> torch.Tensor:
+        """VAE-encode the host tensor prefetch_cpu_only prepared for this batch.
+
+        That tensor is a uint8 (B, H, W, 3) stack under fast_vae and the
+        image_processor's normalised float tensor otherwise.
+        """
+        if self._vae_enc is not None:
+            return ops.encode_uint8_batch_to_latent(
+                self._vae_enc, vae_input, self.device, torch.float16, self.dtype,
+            )
+        vae_input = vae_input.to(device=self.device, dtype=self.dtype)
+        return ops.retrieve_latents(
+            self.pipeline.vae.encode(vae_input), sample_mode="argmax",
+        )
+
+    def _decode(self, latents: torch.Tensor) -> list:
+        """Decode latents to output frames in `output_type`."""
+        if self._vae_dec is not None:
+            arr = ops.decode_latent_to_uint8(
+                self.pipeline, self._vae_dec, latents, torch.float16,
+            )
+            if self.output_type == "np":
+                return list(arr)
+            return [Image.fromarray(a) for a in arr]
+        images = ops.decode_latent(self.pipeline, latents, output_type="pil")
+        if self.output_type == "np":
+            return [np.asarray(im) for im in images]
+        return images
+
+    def _make_init_latents(self, B: int) -> torch.Tensor:
+        """Init noise for a batch of B frames under the configured policy."""
+        s = self.state
+        if self.shared_noise:
+            cached = self._shared_noise_cache
+            vae_scale = self.pipeline.vae_scale_factor
+            lat_hw = (s.height // vae_scale, s.width // vae_scale)
+            if cached is None or tuple(cached.shape[-2:]) != lat_hw:
+                gen = None
+                if self.seed is not None:
+                    gen = torch.Generator(device="cpu").manual_seed(self.seed)
+                cached = ops.make_init_noise(
+                    self.pipeline, height=s.height, width=s.width,
+                    device=self.device, dtype=self.dtype, generator=gen, batch_size=1,
+                )
+                self._shared_noise_cache = cached
+            # .contiguous() materialises a fresh B-major tensor per call, so
+            # the compiled UNet never sees a stride-0 broadcast view.
+            return cached.expand(B, -1, -1, -1).contiguous()
+        gen = None
+        if self.seed is not None:
+            seed_offset = 0 if self.fixed_noise else s.frame_idx
+            gen = torch.Generator(device="cpu").manual_seed(self.seed + seed_offset)
+        return ops.make_init_noise(
+            self.pipeline, height=s.height, width=s.width,
+            device=self.device, dtype=self.dtype, generator=gen, batch_size=B,
+        )
 
     def _enable_compile(self) -> None:
         # Skip if already compiled by a previous worker — re-wrapping would
         # chain OptimizedModule on OptimizedModule, breaking attribute
         # delegation (.config etc.) and re-paying the compile cost.
+        if getattr(self.pipeline.unet, "is_trt_engine", False):
+            return  # a TensorRT engine stands in for the UNet; nothing to compile
         if hasattr(self.pipeline.unet, "_orig_mod"):
             self._compiled = True
             return
@@ -325,20 +531,11 @@ class BatchedEditWorker:
 
         # VAE encode (also batched, sub-linear like TE)
         t = time.perf_counter()
-        ref_latents = ops.encode_image_to_latent_batch(
-            self.pipeline, frames, s.height, s.width, self.device, self.dtype,
-        )
+        ref_latents = self._encode_ref_latents(frames)
         self._gpu_sync(); timing.vae_enc_ms = (time.perf_counter() - t) * 1000
 
         # Init noise (batched)
-        gen = None
-        if self.seed is not None:
-            seed_offset = 0 if self.fixed_noise else s.frame_idx
-            gen = torch.Generator(device="cpu").manual_seed(self.seed + seed_offset)
-        init_latents = ops.make_init_noise(
-            self.pipeline, height=s.height, width=s.width,
-            device=self.device, dtype=self.dtype, generator=gen, batch_size=B,
-        )
+        init_latents = self._make_init_latents(B)
 
         # Feed per-frame cond images to LLLite (no-op if no controller)
         self._set_lllite_cond_for_batch(frames)
@@ -358,7 +555,7 @@ class BatchedEditWorker:
 
         # Decode (returns list)
         t = time.perf_counter()
-        images = ops.decode_latent(self.pipeline, out_latents, output_type="pil")
+        images = self._decode(out_latents)
         self._gpu_sync(); timing.vae_dec_ms = (time.perf_counter() - t) * 1000
 
         self._track_decoded_for_lllite(frames, images)
@@ -383,14 +580,7 @@ class BatchedEditWorker:
         # `te_refresh_every` batches. Cached embeds from a previous call
         # are reused in between; they're frozen GPU tensors so they don't
         # depend on the new side-stream events.
-        should_refresh_te = (
-            self._cached_te_embeds is None
-            or self._force_te_refresh
-            or self._te_call_idx % max(1, self.te_refresh_every) == 0
-        )
-        self._te_call_idx += 1
-        if self._force_te_refresh:
-            self._force_te_refresh = False
+        should_refresh_te = self._te_refresh_due()
 
         if self._side_stream is None:
             if should_refresh_te:
@@ -424,9 +614,7 @@ class BatchedEditWorker:
             else:
                 te = self._cached_te_embeds.clone()
                 mask = self._cached_te_mask.clone()
-            ref = ops.encode_image_to_latent_batch(
-                self.pipeline, frames, s.height, s.width, self.device, self.dtype,
-            )
+            ref = self._encode_ref_latents(frames)
             return PrefetchedBatch(
                 prompt_embeds=te, prompt_mask=mask, ref_latents=ref, n_frames=B,
                 host_ms=(time.perf_counter() - t_host) * 1000,
@@ -471,9 +659,7 @@ class BatchedEditWorker:
                 te = self._cached_te_embeds.clone()
                 mask = self._cached_te_mask.clone()
             ev_after_te.record(side)
-            ref = ops.encode_image_to_latent_batch(
-                self.pipeline, frames, s.height, s.width, self.device, self.dtype,
-            )
+            ref = self._encode_ref_latents(frames)
             ev_done.record(side)
         if should_refresh_te:
             # Publish ev_after_te (recorded after TE forward on _side_stream)
@@ -543,26 +729,25 @@ class BatchedEditWorker:
         """
         s = self.state
 
-        should_refresh_te = (
-            self._cached_te_embeds is None
-            or self._force_te_refresh
-            or self._te_call_idx % max(1, self.te_refresh_every) == 0
-        )
-        self._te_call_idx += 1
-        if self._force_te_refresh:
-            self._force_te_refresh = False
+        should_refresh_te = self._te_refresh_due()
 
         # VAE preprocess is always required (per-batch reference latents
         # depend on the new frames regardless of TE refresh schedule).
-        needs_resize = any(img.size != (s.width, s.height) for img in frames)
-        if needs_resize:
-            vae_imgs = [
-                img.resize((s.width, s.height), Image.Resampling.BILINEAR)
-                for img in frames
-            ]
+        if self._vae_enc is not None:
+            # fast_vae: only stack to uint8 here; prefetch_gpu_kick
+            # normalises on the GPU.
+            vae_input_cpu = ops.frames_to_uint8_batch(frames, s.height, s.width)
         else:
-            vae_imgs = frames
-        vae_input_cpu = self.pipeline.image_processor.preprocess(vae_imgs)
+            pil_frames = [ops.as_pil(img) for img in frames]
+            needs_resize = any(img.size != (s.width, s.height) for img in pil_frames)
+            if needs_resize:
+                vae_imgs = [
+                    img.resize((s.width, s.height), Image.Resampling.BILINEAR)
+                    for img in pil_frames
+                ]
+            else:
+                vae_imgs = pil_frames
+            vae_input_cpu = self.pipeline.image_processor.preprocess(vae_imgs)
 
         if should_refresh_te:
             B = len(frames)
@@ -577,7 +762,10 @@ class BatchedEditWorker:
                 te_frames = frames
             decorated = [self._PROMPT_DECORATION.format(p) for p in te_prompts]
             txts = [self._PROMPT_TEMPLATE.format(p) for p in decorated]
-            pil_imgs = [img.resize((256, 256), Image.Resampling.BILINEAR) for img in te_frames]
+            pil_imgs = [
+                ops.as_pil(img).resize((256, 256), Image.Resampling.BILINEAR)
+                for img in te_frames
+            ]
             # padding="max_length" fixes input_ids length to PROMPT_MAX_LEN
             # regardless of prompt content, so hidden_states (and the
             # downstream prompt_embeds shape fed to UNet) is constant
@@ -667,10 +855,7 @@ class BatchedEditWorker:
                 torch.cuda.current_stream().wait_event(self._last_cache_te_ev)
             te = self._cached_te_embeds.clone()
             mask = self._cached_te_mask.clone()
-            vae_input = cpu_prep["vae_input"].to(device=self.device, dtype=self.dtype)
-            ref = ops.retrieve_latents(
-                self.pipeline.vae.encode(vae_input), sample_mode="argmax",
-            )
+            ref = self._encode_prepared(cpu_prep["vae_input"])
             return PrefetchedBatch(
                 prompt_embeds=te, prompt_mask=mask, ref_latents=ref, n_frames=B,
                 host_ms=(time.perf_counter() - t_host) * 1000,
@@ -699,10 +884,7 @@ class BatchedEditWorker:
             te = self._cached_te_embeds.clone()
             mask = self._cached_te_mask.clone()
             ev_after_te.record(side)
-            vae_input = cpu_prep["vae_input"].to(device=self.device, dtype=self.dtype)
-            ref = ops.retrieve_latents(
-                self.pipeline.vae.encode(vae_input), sample_mode="argmax",
-            )
+            ref = self._encode_prepared(cpu_prep["vae_input"])
             ev_done.record(side)
 
         return PrefetchedBatch(
@@ -731,14 +913,7 @@ class BatchedEditWorker:
         timesteps = self._ensure_timesteps()
         time_ids = ops.make_time_ids(s.width, s.height, self.device, self.dtype).expand(B, -1)
 
-        gen = None
-        if self.seed is not None:
-            seed_offset = 0 if self.fixed_noise else s.frame_idx
-            gen = torch.Generator(device="cpu").manual_seed(self.seed + seed_offset)
-        init_latents = ops.make_init_noise(
-            self.pipeline, height=s.height, width=s.width,
-            device=self.device, dtype=self.dtype, generator=gen, batch_size=B,
-        )
+        init_latents = self._make_init_latents(B)
 
         # Feed per-frame cond images to LLLite. If prefetch kicked the CPU
         # flow async (refresh batch), await it here — the wait is hidden by
@@ -762,7 +937,7 @@ class BatchedEditWorker:
         self._gpu_sync(); timing.denoise_ms = (time.perf_counter() - t) * 1000
 
         t = time.perf_counter()
-        images = ops.decode_latent(self.pipeline, out_latents, output_type="pil")
+        images = self._decode(out_latents)
         self._gpu_sync(); timing.vae_dec_ms = (time.perf_counter() - t) * 1000
 
         # Read side-stream timing after sync

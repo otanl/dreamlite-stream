@@ -37,6 +37,22 @@ def make_time_ids(width: int, height: int, device, dtype) -> torch.Tensor:
     return torch.tensor([[width, height]], device=device, dtype=dtype)
 
 
+def as_rgb_array(image) -> np.ndarray:
+    """uint8 (H, W, 3) RGB array for a PIL image or an ndarray frame."""
+    if isinstance(image, np.ndarray):
+        return image
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    return np.asarray(image)
+
+
+def as_pil(image) -> Image.Image:
+    """PIL image for a PIL image or a uint8 (H, W, 3) RGB ndarray frame."""
+    if isinstance(image, np.ndarray):
+        return Image.fromarray(image)
+    return image
+
+
 def set_timesteps(
     pipeline,
     height: int,
@@ -167,7 +183,7 @@ def encode_prompt_edit_batch(
     txts = [template.format(p) for p in decorated]
     # BILINEAR is ~6x faster than LANCZOS for downscaling and the Q3-VL
     # vision encoder normalises away most of the high-frequency difference.
-    pil_imgs = [img.resize((256, 256), Image.Resampling.BILINEAR) for img in images]
+    pil_imgs = [as_pil(img).resize((256, 256), Image.Resampling.BILINEAR) for img in images]
 
     # padding="max_length" keeps the encoder_hidden_states' sequence length
     # constant across calls regardless of prompt content. Required so a
@@ -222,6 +238,7 @@ def encode_image_to_latent_batch(
     # 512x512 PIL straight in, so this is the common case at B=8). Otherwise
     # use BILINEAR (LANCZOS is ~6x slower for trivial perceptual gain at VAE
     # encoder input — the encoder is robust to interpolation method).
+    images = [as_pil(img) for img in images]
     needs_resize = any(img.size != (width, height) for img in images)
     if needs_resize:
         resized = [img.resize((width, height), Image.Resampling.BILINEAR) for img in images]
@@ -229,6 +246,43 @@ def encode_image_to_latent_batch(
         resized = images
     processed = pipeline.image_processor.preprocess(resized).to(device=device, dtype=dtype)
     return retrieve_latents(pipeline.vae.encode(processed), sample_mode="argmax")
+
+
+def frames_to_uint8_batch(images, height: int, width: int) -> torch.Tensor:
+    """Stack frames into a CPU uint8 tensor of shape (N, H, W, 3).
+
+    Accepts PIL images or uint8 RGB arrays. Frames already at the target
+    size are stacked as they are; others are resized the same way the PIL
+    path does (BILINEAR).
+    """
+    arrs = []
+    for img in images:
+        a = as_rgb_array(img)
+        if a.shape[0] != height or a.shape[1] != width:
+            a = np.asarray(as_pil(a).resize((width, height), Image.Resampling.BILINEAR))
+        arrs.append(a)
+    return torch.from_numpy(np.stack(arrs, axis=0))
+
+
+@torch.no_grad()
+def encode_uint8_batch_to_latent(
+    vae_encoder,
+    frames_u8: torch.Tensor,
+    device,
+    vae_dtype,
+    out_dtype,
+) -> torch.Tensor:
+    """VAE-encode a uint8 (N, H, W, 3) batch, normalising on the GPU.
+
+    Counterpart of `encode_image_to_latent_batch` without the host-side
+    `image_processor.preprocess` (PIL -> float -> normalise), which costs
+    ~5 ms per 512x512 frame on the calling thread. `vae_encoder` is the
+    encoder module of an AutoencoderTiny held in `vae_dtype` /
+    channels_last; the result is cast to `out_dtype` for the UNet.
+    """
+    x = frames_u8.to(device, non_blocking=True).permute(0, 3, 1, 2).to(vae_dtype)
+    x = x.div_(127.5).sub_(1.0).contiguous(memory_format=torch.channels_last)
+    return vae_encoder(x).to(out_dtype)
 
 
 @torch.no_grad()
@@ -323,3 +377,19 @@ def decode_latent(pipeline, latents: torch.Tensor, output_type: str = "pil") -> 
     scaled = (latents / pipeline.vae.config.scaling_factor) + shift_factor
     decoded = pipeline.vae.decode(scaled, return_dict=False)[0]
     return pipeline.image_processor.postprocess(decoded, output_type=output_type)
+
+
+@torch.no_grad()
+def decode_latent_to_uint8(pipeline, vae_decoder, latents: torch.Tensor, vae_dtype) -> np.ndarray:
+    """Decode latents to a uint8 (N, H, W, 3) RGB array with one host transfer.
+
+    Counterpart of `decode_latent` without `image_processor.postprocess`
+    (float32 copy to host, then one PIL image per frame; ~4 ms per 512x512
+    frame). Quantisation to uint8 happens on the GPU. `vae_decoder` is the
+    decoder module of an AutoencoderTiny held in `vae_dtype` / channels_last.
+    """
+    shift_factor = getattr(pipeline.vae.config, "shift_factor", 0.0) or 0.0
+    scaled = ((latents / pipeline.vae.config.scaling_factor) + shift_factor).to(vae_dtype)
+    decoded = vae_decoder(scaled.contiguous(memory_format=torch.channels_last))
+    u8 = decoded.float().clamp_(-1.0, 1.0).add_(1.0).mul_(127.5).round_().to(torch.uint8)
+    return u8.permute(0, 2, 3, 1).contiguous().cpu().numpy()
