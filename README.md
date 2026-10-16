@@ -108,6 +108,15 @@ python scripts/infer_temporal_lllite.py \
     --prompt "transfer this to oil painting style, vibrant colors"
 ```
 
+Demo video (input | one panel per prompt for every clip in `assets/davis_mp4/`,
+each panel labelled with the loop fps of its run; TensorRT engine from
+"TensorRT backend" below, interpreter with tensorrt):
+
+```bash
+python scripts/make_demo.py --lean --size 768 --trt_engine out/trt/unet_768_b8_lora.engine \
+    --prompts oil anime --out_dir out/demo_768
+```
+
 Live webcam / NDI demo (input | stylized output side-by-side, fps overlay):
 
 ```bash

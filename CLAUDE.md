@@ -74,6 +74,8 @@ $PY scripts/build_trt_unet.py --size 768 --batch_size 8 --lllite_multiplier 0 \
 $PY scripts/build_trt_rife.py --size 768 --batch_size 8             # -> out/trt/rife_768_b8.engine
 $PY scripts/sustained_throughput_test.py --lean --size 768 --batch_size 8 \
     --trt_engine out/trt/unet_768_b8_lora.engine
+# Demo video, input | oil | anime per DAVIS clip -> out/demo_768/<clip>.mp4 and demo.mp4
+$PY scripts/make_demo.py --lean --size 768 --trt_engine out/trt/unet_768_b8_lora.engine --out_dir out/demo_768
 ```
 
 Tests are standalone scripts with a `__main__` block, not pytest. `scripts/test_idpruner_algorithm.py`, `scripts/test_lean_options.py`, `scripts/test_onestep_lora.py` and `scripts/test_rife_interp.py` run on CPU without weights; the other `scripts/test_*.py` load the model on CUDA, and the `test_trt_*` ones also need an engine from the older TensorRT attempt.
