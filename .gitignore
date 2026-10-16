@@ -58,7 +58,7 @@ assets/crossds_512/
 
 # Track the small fixtures needed to reproduce paper figures:
 #   assets/davis_mp4/         (10 DAVIS sequences used by champion_eval)
-#   assets/scene_cut/         (Appendix B synthetic cut clips, ~4 MB)
+#   assets/scene_cut/         (synthetic scene-cut clips, Table IX, ~4 MB)
 
 # ===== Paper-figure intermediates =====
 figures_for_paper/

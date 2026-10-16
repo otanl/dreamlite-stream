@@ -10,9 +10,9 @@ MLLM-conditioned edit-diffusion stack.
 > commercial use, no malicious use). See [`USE_POLICY.md`](USE_POLICY.md)
 > for the verbatim upstream notice and what it means in practice.
 
-This repository accompanies the preprint **_Video-Rate Streaming
-Stylization on a Vision-Aware MLLM-Conditioned Edit Diffusion:
-Asymmetric Batched Inference on a Distilled UNet + MLLM Text Encoder_**
+This repository accompanies the preprint **_Inverting the
+Streaming-Diffusion Bottleneck: Video-Rate MLLM-Conditioned Edit
+Diffusion on a Consumer GPU_**
 ([arXiv:2606.05981](https://arxiv.org/abs/2606.05981)) and contains
 the inference runtime, training scripts, evaluation harness, and a
 trained Temporal LLLite adapter (v3) used to produce the paper's
@@ -441,9 +441,9 @@ the batching, the carried frame and the padding on CPU without weights.
 
 ## Reproducing paper tables and figures
 
-Table labels below match the arXiv preprint
-(Roman-numeral table numbering; content described in case of future
-re-numbering).
+Table labels below match version 2 of the arXiv preprint (v1 had no
+Table VI, so its Tables VI-XII are VII-XIII here); the content is
+described in case of future re-numbering.
 
 | Paper artefact (content) | Script | Notes |
 |---|---|---|
@@ -451,16 +451,18 @@ re-numbering).
 | Table III — Sustained throughput + latency | `scripts/sustained_throughput_test.py` | 480-frame *parkour* loop, p50/p95 latency |
 | Table IV — In-pipeline component profile | `scripts/profile_inpipeline.py` | TE/UNet/VAE per-batch wall, side vs. main |
 | Table V — Per-component batch scaling | `scripts/measure_te_batch_scaling.py` + `scripts/measure_batch_scaling.py` | TE and U-Net in isolation at B in {1,2,4,8}; sub-linearity per component |
-| Table VI — Cond-refresh sweep | `scripts/cond_refresh_sweep_downblocks.py` + `scripts/cond_refresh_spatial_metrics.py` | N in {1,4,8,16} fps/εw + Sobel/HF-FFT/LPIPS-to-N=1 |
-| Table VII — Long-sequence drift | `scripts/sustained_throughput_test.py --chunked` | 480-frame *parkour*, per-64-frame chunk std |
-| Table VIII — Scene-cut robustness | `scripts/scene_cut_eval.py`, `scripts/scene_cut_lpips.py` | synthetic hard-cut clips |
-| Table IX — Transfer evaluation (v5-heldout / DAVIS-19 unused / cross-dataset) | `scripts/eval_heldout_video.py`, `scripts/champion_eval.py --sequences ...`, `scripts/phase3_crossds_local.py` | (a)+(b)+(c) panels of Table IX |
-| Table X — Multi-prompt v4 LLLite | `scripts/eval_multiprompt.py` | 5-prompt v4 LLLite |
-| Table XI — Hardware scaling (3090 Ti / 4090 / 5090) | `scripts/champion_eval.py` per host | sustained fps headline across GPUs |
-| Table XII — LCM-LoRA distillation case study | `scripts/train_lcm_lora.py` + `scripts/champion_eval.py` | v1 blended-teacher target negative result |
-| Figure 1 — Smoothing artefact teaser | `scripts/viz_temporal_pair.py` | LCM-LoRA vs. LLLite vs. baseline |
-| Figure 2 — Pipeline schematic | — | drawn from Table IV numbers, source SVG in the paper repo |
-| Figures 3, 4 — Qualitative grids | `scripts/extract_figure_frames.py` + `build_qualitative_grid_svg.py` + `build_scenecut_grid_svg.py` | regenerate from the saved mp4s |
+| Table VI — Independent baseline (StreamV2V) | `scripts/prep_davis_512sq_for_baseline.py`, `scripts/score_streamv2v_baseline.py`, `scripts/smoothing_collapse_vs_streamv2v.py` | StreamV2V itself runs from its own repository on the prepared 512×512 clips; warp error read with the Sobel / HF-FFT panel |
+| Table VII — Cond-refresh sweep | `scripts/cond_refresh_sweep_downblocks.py` + `scripts/cond_refresh_spatial_metrics.py` | N in {1,4,8,16} fps/εw + Sobel/HF-FFT/LPIPS-to-N=1 |
+| Table VIII — Long-sequence drift | `scripts/sustained_throughput_test.py --chunked` | 480-frame *parkour*, per-64-frame chunk std |
+| Table IX — Scene-cut robustness | `scripts/scene_cut_eval.py`, `scripts/scene_cut_lpips.py` | synthetic hard-cut clips |
+| Table X — Transfer evaluation (v5-heldout / DAVIS-19 unused / cross-dataset / held-out prompts) | `scripts/eval_heldout_video.py`, `scripts/champion_eval.py --sequences ...`, `scripts/phase3_crossds_local.py`, `scripts/eval_heldout_prompts.py` | panels (a)-(d) of Table X; (d) is the held-out style prompts |
+| Table XI — Multi-prompt v4 LLLite | `scripts/eval_multiprompt.py` | 5-prompt v4 LLLite |
+| Table XII — Hardware scaling (3090 Ti / 4090 / 5090) | `scripts/champion_eval.py` per host | sustained fps headline across GPUs |
+| Table XIII — LCM-LoRA distillation case study | `scripts/train_lcm_lora.py` + `scripts/champion_eval.py` | v1 blended-teacher target negative result |
+| Figure 1 — Pipeline schematic (asymmetric batched dispatch) | — | drawn from Table IV numbers, source SVG in the paper repo |
+| Figure 2 — Scene-cut grid | `scripts/extract_figure_frames.py` + `build_scenecut_grid_svg.py` | regenerate from the saved mp4s |
+| Figure 3 — Held-out-prompt qualitative grid | `scripts/extract_figure_frames.py` + `build_qualitative_grid_svg.py` | regenerate from the saved mp4s |
+| Figure 4 — Smoothing artefact | `scripts/viz_temporal_pair.py` | LCM-LoRA vs. LLLite vs. baseline |
 | Negative result — Token pruning | `scripts/champion_eval_token_pruning.py` | pruned-prompt eval |
 | Negative result — TensorRT path | `scripts/export_unet_lllite_onnx.py`, `scripts/build_trt_engine_mixed.py`, `scripts/debug_lllite_trt_drift.py` | LLLite-baked TRT export attempt as reported in the paper; "TensorRT backend" above gives the cause and a working build |
 
@@ -488,7 +490,7 @@ the scripts rather than read from committed logs.
   reproducible from the training script
   (`scripts/train_temporal_lllite.py`) given the upstream
   DreamLite-mobile weights.
-- **Synthetic scene-cut clips** (Appendix B) under `assets/scene_cut/`.
+- **Synthetic scene-cut clips** (§IV-C, Table IX) under `assets/scene_cut/`.
 
 ## Reproducibility caveats
 
@@ -536,10 +538,9 @@ those with transformers 4.57.3.
 Please cite the arXiv preprint:
 
 ```bibtex
-@misc{ootani2026videoratestreamingstylizationvisionaware,
-  title         = {Video-Rate Streaming Stylization on a Vision-Aware
-                   MLLM-Conditioned Edit Diffusion: Asymmetric Batched
-                   Inference on a Distilled UNet + MLLM Text Encoder},
+@misc{ootani2026invertingstreamingdiffusionbottleneckvideorate,
+  title         = {Inverting the Streaming-Diffusion Bottleneck: Video-Rate
+                   MLLM-Conditioned Edit Diffusion on a Consumer GPU},
   author        = {Yoshiyuki Ootani},
   year          = {2026},
   eprint        = {2606.05981},

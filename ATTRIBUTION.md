@@ -64,7 +64,7 @@ mp4 fixtures under `assets/davis_mp4/`.
 
 ## Cross-dataset evaluation sources
 
-The Appendix B / Table 13 cross-dataset evaluation uses public
+The cross-dataset evaluation (Table X (c)) uses public
 clips from:
 - Big Buck Bunny — Blender Foundation, CC-BY
 - Sintel — Blender Foundation, CC-BY
@@ -84,9 +84,9 @@ Pipeline integration uses
 both Apache-2.0. The TRT export path uses NVIDIA TensorRT (proprietary
 SDK; users must accept the NVIDIA TensorRT license).
 
-## RAFT (Appendix A)
+## RAFT (§IV-C)
 
-The optical-flow sanity check in Appendix A uses RAFT-Large
+The optical-flow sanity check in §IV-C uses RAFT-Large
 weights distributed via `torchvision.models.optical_flow.raft_large`
 (`C_T_SKHT_V2`); see torchvision's license. RAFT itself is by
 [Teed and Deng, ECCV 2020](https://github.com/princeton-vl/RAFT).
@@ -126,7 +126,7 @@ Practical-RIFE is released under the MIT License:
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 > SOFTWARE.
 
-## LPIPS (Appendix B + spatial fidelity probes)
+## LPIPS (scene-cut evaluation + spatial fidelity probes)
 
 The LPIPS spatial-fidelity probe uses
 [`lpips`](https://github.com/richzhang/PerceptualSimilarity)
