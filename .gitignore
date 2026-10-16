@@ -86,3 +86,6 @@ trt_cache/
 
 # Camera test thumbnails written by scripts/list_cameras.py
 /thumb_cam*.png
+
+# Local agent guidance (machine paths, interpreters)
+CLAUDE.md
