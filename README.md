@@ -20,7 +20,7 @@ tables and figures.
 
 ## Demo
 
-<video src="https://github.com/user-attachments/assets/ec5ee987-4c24-4301-b722-0ad4d8d909af" controls width="960"></video>
+https://github.com/user-attachments/assets/ec5ee987-4c24-4301-b722-0ad4d8d909af
 
 Input | oil painting | anime on five DAVIS-2017 clips, streamed at
 768×768 on an RTX 3090 Ti through the lean path with the one-step LoRA
