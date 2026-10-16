@@ -20,15 +20,14 @@ tables and figures.
 
 ## Demo
 
-<video src="https://github.com/user-attachments/assets/ef31f68a-bc6a-4e14-b2b9-6a60303db30f" controls width="640">
-  See <a href="assets/demo.mp4">assets/demo.mp4</a> for the live-demo sample.
-</video>
+<video src="https://github.com/user-attachments/assets/648d0c21-593e-4e15-81a1-71c8a21c332a" controls width="960"></video>
 
-`scripts/demo_camera.py` stylizing a
-[Pexels](https://www.pexels.com/) stock clip on a 3090 Ti at
-512×512. Observed end-to-end fps is slightly below the paper's
-step-only sustained number due to display pacing and frame-drop
-bookkeeping in the demo path.
+Input | oil painting | anime on five DAVIS-2017 clips, streamed at
+768×768 on an RTX 3090 Ti through the lean path with the one-step LoRA
+merged into a TensorRT UNet (`scripts/make_demo.py`). Each output panel
+shows the loop fps of its run: 23-24 fps on these short clips with one
+warm-up batch, 25.1 fps for the same configuration in the table under
+"One-step LoRA". Clips: [DAVIS-2017](https://davischallenge.org/), CC BY 4.0.
 
 ## What is in this repository
 
