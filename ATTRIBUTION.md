@@ -47,11 +47,14 @@ addition to the DreamLite license.
 ## DAVIS-2017 (evaluation and demo video)
 
 The headline evaluation in the paper uses
-[DAVIS-2017](https://davischallenge.org/davis2017/code.html), which
-is released under CC BY 4.0. We re-encode the 480p source frames as
-mp4 fixtures under `assets/davis_mp4/`. The demo video in the README
-(made by `scripts/make_demo.py`) shows five of these clips next to
-their stylized outputs.
+[DAVIS-2017](https://davischallenge.org/davis2017/code.html). Its
+organizers license the annotations they created under CC BY 4.0
+(challenge rules page), and the site's dataset metadata lists
+CC BY-NC 4.0; no separate licence is stated for the video frames.
+We use the frames only, for non-commercial research: the 480p source
+frames are re-encoded as mp4 fixtures under `assets/davis_mp4/`, and
+the demo video in the README (made by `scripts/make_demo.py`) shows
+five of these clips next to their stylized outputs.
 
 ## Cross-dataset evaluation sources
 

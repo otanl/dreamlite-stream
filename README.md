@@ -27,7 +27,8 @@ Input | oil painting | anime on five DAVIS-2017 clips, streamed at
 merged into a TensorRT UNet (`scripts/make_demo.py`). Each output panel
 shows the loop fps of its run: 23-24 fps on these short clips with one
 warm-up batch, 25.1 fps for the same configuration in the table under
-"One-step LoRA". Clips: [DAVIS-2017](https://davischallenge.org/), CC BY 4.0.
+"One-step LoRA". Input clips: [DAVIS-2017](https://davischallenge.org/), see
+[ATTRIBUTION.md](ATTRIBUTION.md).
 
 ## What is in this repository
 
